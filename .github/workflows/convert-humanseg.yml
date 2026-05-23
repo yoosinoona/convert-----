@@ -19,7 +19,6 @@ jobs:
           pip install numpy==1.26.4
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install pnnx
-          pip install onnx onnxsim onnxruntime onnx2torch
 
       - name: Run conversion
         run: python tools/convert_humanseg.py
