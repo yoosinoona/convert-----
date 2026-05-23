@@ -1,14 +1,11 @@
 """
-Convert PP-HumanSegV2 Mobile → NCNN
-Pipeline: PaddleSeg → ONNX → Simplify → NCNN → Optimize
+Convert PP-HumanSegV2 Mobile → ONNX → NCNN
 """
 
 import os
 import subprocess
 import shutil
 import urllib.request
-
-# ─── Config ────────────────────────────────────────
 
 NCNN_TOOLS_URL = (
     "https://github.com/Tencent/ncnn/releases/download/20240820/"
@@ -19,32 +16,52 @@ WORK_DIR = "convert_tmp"
 OUTPUT_DIR = "output"
 
 
-# ─── Step 1: Export PaddleSeg model to ONNX ────────
+# ─── Step 1: Export via paddleseg's built-in tools ─
 
 def export_to_onnx():
     os.makedirs(WORK_DIR, exist_ok=True)
     onnx_path = os.path.join(WORK_DIR, "humansegv2.onnx")
 
-    print("[1/4] Exporting PP-HumanSegV2 via paddleseg...")
+    print("[1/4] Exporting PP-HumanSegV2...")
 
+    # Download pretrained model using paddleseg's model zoo
     import paddle
     from paddleseg.models import PPMobileSeg
 
-    # Load pretrained model
-    model = PPMobileSeg(
-        num_classes=2,
-        backbone_channels=[32, 64, 128],
-        head_channels=128,
-        align_corners=False,
-    )
+    # Try loading model with minimal args
+    try:
+        model = PPMobileSeg(num_classes=2)
+    except TypeError:
+        # Fallback: introspect constructor
+        import inspect
+        sig = inspect.signature(PPMobileSeg.__init__)
+        print(f"    PPMobileSeg params: {list(sig.parameters.keys())}")
+        kwargs = {}
+        for p in sig.parameters.values():
+            if p.default is not inspect.Parameter.empty:
+                kwargs[p.name] = p.default
+            elif p.name in ('self',):
+                continue
+            elif p.name == 'num_classes':
+                kwargs[p.name] = 2
+        model = PPMobileSeg(**kwargs)
 
     # Download pretrained weights
-    model_url = "https://paddleseg.bj.bcebos.com/dygraph/pp_humanseg_v2/pp_humansegv2_mobile_192x192_pretrained/model.pdparams"
+    model_url = (
+        "https://paddleseg.bj.bcebos.com/dygraph/pp_humanseg_v2/"
+        "pp_humansegv2_mobile_192x192_pretrained/model.pdparams"
+    )
     weights_path = os.path.join(WORK_DIR, "model.pdparams")
 
     if not os.path.exists(weights_path):
-        print("    Downloading weights...")
-        urllib.request.urlretrieve(model_url, weights_path)
+        print("    Downloading pretrained weights...")
+        try:
+            urllib.request.urlretrieve(model_url, weights_path)
+        except Exception as e:
+            print(f"    Direct download failed: {e}")
+            # Try paddleseg's built-in download
+            from paddleseg.utils import download_pretrained_model
+            weights_path = download_pretrained_model(model_url)
 
     model.set_state_dict(paddle.load(weights_path))
     model.eval()
@@ -52,7 +69,7 @@ def export_to_onnx():
     # Export to ONNX
     print("    Converting to ONNX...")
     input_spec = paddle.static.InputSpec(
-        shape=[1, 3, 192, 192], dtype="float32"
+        shape=[1, 3, 192, 192], dtype="float32", name="x"
     )
 
     paddle.onnx.export(
@@ -62,13 +79,14 @@ def export_to_onnx():
         opset_version=11,
     )
 
-    # Rename output
     exported = os.path.join(WORK_DIR, "humansegv2.onnx")
     if os.path.exists(exported):
         print(f"    Saved: {exported}")
         return exported
 
-    raise FileNotFoundError("ONNX export failed")
+    raise FileNotFoundError(
+        f"ONNX export failed. Files in {WORK_DIR}: {os.listdir(WORK_DIR)}"
+    )
 
 
 # ─── Step 2: Simplify ONNX ─────────────────────────
@@ -115,8 +133,11 @@ def download_ncnn_tools():
             break
 
     os.rename(extracted, ncnn_dir)
-    os.chmod(os.path.join(ncnn_dir, "bin", "onnx2ncnn"), 0o755)
-    os.chmod(os.path.join(ncnn_dir, "bin", "ncnn-optimize"), 0o755)
+    for tool in ["onnx2ncnn", "ncnn-optimize"]:
+        tool_path = os.path.join(ncnn_dir, "bin", tool)
+        if os.path.exists(tool_path):
+            os.chmod(tool_path, 0o755)
+
     print(f"    Tools at: {ncnn_dir}/bin/")
     return ncnn_dir
 
@@ -137,12 +158,15 @@ def onnx_to_ncnn(sim_path, ncnn_tools_dir):
     print("[4b/4] Optimizing NCNN model...")
     opt_param = os.path.join(OUTPUT_DIR, "humansegv2.param")
     opt_bin = os.path.join(OUTPUT_DIR, "humansegv2.bin")
-    subprocess.run([ncnn_opt, raw_param, raw_bin, opt_param, opt_bin], check=True)
+    subprocess.run(
+        [ncnn_opt, raw_param, raw_bin, opt_param, opt_bin],
+        check=True,
+    )
 
     p_size = os.path.getsize(opt_param)
     b_size = os.path.getsize(opt_bin)
-    print(f"    Output: {opt_param} ({p_size:,} bytes)")
-    print(f"    Output: {opt_bin} ({b_size:,} bytes)")
+    print(f"    Output: humansegv2.param ({p_size:,} bytes)")
+    print(f"    Output: humansegv2.bin ({b_size:,} bytes)")
     print(f"    Total:  {(p_size + b_size) / 1024 / 1024:.2f} MB")
 
 
