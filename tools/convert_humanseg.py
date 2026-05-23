@@ -1,6 +1,5 @@
 """
 Person Segmentation ONNX → NCNN
-Dùng model ONNX có sẵn, không cần PaddlePaddle
 """
 
 import os
@@ -17,41 +16,40 @@ NCNN_TOOLS_URL = (
     "ncnn-20240820-ubuntu.zip"
 )
 
-# Pre-exported ONNX models (thử lần lượt)
-# ISNet general segmentation từ ONNX Model Zoo
 MODEL_SOURCES = [
     {
-        "name": "U2Net portrait (rembg)",
-        "url": "https://github.com/danielgatis/rembg/raw/main/rembg/u2net/u2net.onnx",
+        "name": "U2Net salient (HuggingFace - ControlNet)",
+        "url": "https://huggingface.co/lllyasviel/Annotators/resolve/main/u2net.onnx",
     },
     {
-        "name": "ISNet (ONNX Zoo)",
-        "url": "https://github.com/danielgatis/rembg/raw/main/rembg/isnet-general-use/isnet-general-use.onnx",
+        "name": "ISNet general (HuggingFace - rembg)",
+        "url": "https://huggingface.co/briaai/RMBG-1.4/resolve/main/onnx/model.onnx",
     },
 ]
-
-
-def run_cmd(cmd, cwd=None):
-    print(f"    $ {cmd}")
-    result = subprocess.run(cmd, shell=True, cwd=cwd)
-    if result.returncode != 0:
-        print(f"    WARNING: exit code {result.returncode}")
-    return result.returncode
 
 
 def download_model():
     os.makedirs(WORK_DIR, exist_ok=True)
     onnx_path = os.path.join(WORK_DIR, "model.onnx")
 
-    print("[1/3] Downloading person segmentation ONNX model...")
+    print("[1/3] Downloading segmentation ONNX model...")
 
     for source in MODEL_SOURCES:
         try:
             print(f"    Trying: {source['name']}...")
-            urllib.request.urlretrieve(source["url"], onnx_path)
+
+            req = urllib.request.Request(
+                source["url"],
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(req) as response:
+                with open(onnx_path, "wb") as f:
+                    shutil.copyfileobj(response, f)
+
             size_mb = os.path.getsize(onnx_path) / 1024 / 1024
             print(f"    OK! ({size_mb:.1f} MB)")
             return onnx_path
+
         except Exception as e:
             print(f"    Failed: {e}")
             continue
@@ -67,26 +65,21 @@ def simplify_onnx(onnx_path):
     from onnxsim import simplify
 
     model = onnx.load(onnx_path)
-    input_info = model.graph.input[0]
-    name = input_info.name
-    shape = [d.dim_value for d in input_info.type.tensor_type.shape.dim]
+    inp = model.graph.input[0]
+    name = inp.name
+    shape = [d.dim_value for d in inp.type.tensor_type.shape.dim]
     print(f"    Input: {name} shape={shape}")
     print(f"    Outputs: {[o.name for o in model.graph.output]}")
 
-    # Only simplify if shape is valid
     if all(s > 0 for s in shape):
         model_sim, check = simplify(model, input_shapes={name: shape})
-    else:
-        print("    Skipping simplify (dynamic shape)")
-        return onnx_path
+        if check:
+            onnx.save(model_sim, sim_path)
+            print(f"    Simplified OK")
+            return sim_path
 
-    if check:
-        onnx.save(model_sim, sim_path)
-        print(f"    Simplified: {sim_path}")
-        return sim_path
-    else:
-        print("    Simplify failed, using original")
-        return onnx_path
+    print("    Using original (skip simplify)")
+    return onnx_path
 
 
 def download_ncnn_tools():
@@ -138,7 +131,7 @@ def convert_ncnn(model_path, ncnn_dir):
 
 def main():
     print("=" * 50)
-    print("Person Segmentation ONNX → NCNN")
+    print("Segmentation ONNX → NCNN")
     print("=" * 50)
 
     onnx_path = download_model()
