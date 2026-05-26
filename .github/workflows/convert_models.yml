@@ -25,10 +25,13 @@ jobs:
 
       - name: Install ncnn tools (onnx2ncnn binary)
         run: |
+          sudo apt-get update
+          sudo apt-get install -y libprotobuf-dev protobuf-compiler
           wget -q https://github.com/Tencent/ncnn/releases/download/20240820/ncnn-20240820-ubuntu-2204.zip
           unzip -q ncnn-20240820-ubuntu-2204.zip
           sudo cp ncnn-20240820-ubuntu-2204/bin/onnx2ncnn /usr/local/bin/
           sudo chmod +x /usr/local/bin/onnx2ncnn
+          ldd /usr/local/bin/onnx2ncnn | grep "not found" && echo "MISSING LIBS!" || echo "All libs OK"
           onnx2ncnn 2>&1 | head -3 || true
 
       - name: Install Python deps
