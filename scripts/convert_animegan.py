@@ -15,12 +15,10 @@ def find_tool(name):
 def run_cmd(cmd, timeout=300):
     ret = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if ret.stdout:
-        lines = ret.stdout.strip().split('\n')
-        for line in lines[-20:]:
+        for line in ret.stdout.strip().split('\n')[-20:]:
             print(f"   {line}")
     if ret.stderr:
-        lines = ret.stderr.strip().split('\n')
-        for line in lines[-20:]:
+        for line in ret.stderr.strip().split('\n')[-20:]:
             print(f"   [err] {line}")
     return ret
 
@@ -30,11 +28,7 @@ def main():
 
     onnx2ncnn = find_tool("onnx2ncnn")
     ncnnoptimize = find_tool("ncnnoptimize")
-
-    # In version
-    ret = subprocess.run([onnx2ncnn], capture_output=True, text=True)
-    ver = ret.stderr.strip().split('\n')[0] if ret.stderr else "unknown"
-    print(f"onnx2ncnn: {onnx2ncnn} ({ver})")
+    print(f"onnx2ncnn:    {onnx2ncnn}")
     print(f"ncnnoptimize: {ncnnoptimize}")
 
     onnx_file = "AnimeGANv3_PortraitSketch_25.onnx"
@@ -44,18 +38,32 @@ def main():
 
     print(f"Input: {os.path.getsize(onnx_file) / 1024 / 1024:.1f} MB")
 
-    # 1. Simplify ONNX
+    # 1. Simplify ONNX (thử nhiều lần với iter số khác nhau)
     print("\n1. Simplifying ONNX...")
     sim_file = "animegan_sim.onnx"
-    ret = run_cmd([sys.executable, "-m", "onnxsim", onnx_file, sim_file])
-    if ret.returncode != 0 or not os.path.exists(sim_file):
-        print("   Simplify failed, using original")
-        shutil.copy(onnx_file, sim_file)
-    else:
-        print(f"   OK: {os.path.getsize(sim_file) / 1024 / 1024:.1f} MB")
+    success = False
+    for n in [10, 20, 5]:
+        print(f"   Trying onnxsim with max_iters={n}...")
+        ret = run_cmd([
+            sys.executable, "-m", "onnxsim",
+            onnx_file, sim_file,
+            "--max-n-bicycle", str(n),
+        ], timeout=120)
+        if ret.returncode == 0 and os.path.exists(sim_file):
+            success = True
+            break
+
+    if not success:
+        # Fallback: onnxsim không có flag --max-n-bicycle, thử đơn giản
+        ret = run_cmd([sys.executable, "-m", "onnxsim", onnx_file, sim_file])
+        if ret.returncode != 0 or not os.path.exists(sim_file):
+            print("   All simplify attempts failed, using original")
+            shutil.copy(onnx_file, sim_file)
+
+    print(f"   Simplified: {os.path.getsize(sim_file) / 1024 / 1024:.1f} MB")
 
     # 2. ONNX -> NCNN FP32
-    print("\n2. Converting to FP32...")
+    print("\n2. Converting to FP32 via onnx2ncnn...")
     fp32_param = "animegan_fp32.param"
     fp32_bin = "animegan_fp32.bin"
 
@@ -66,21 +74,20 @@ def main():
     ret = run_cmd([onnx2ncnn, sim_file, fp32_param, fp32_bin])
 
     # Kiểm tra output hợp lệ
-    if not os.path.exists(fp32_param) or not os.path.exists(fp32_bin):
-        print("   FAILED: onnx2ncnn did not create output files!")
+    if (not os.path.exists(fp32_param) or not os.path.exists(fp32_bin)
+            or os.path.getsize(fp32_bin) == 0):
+        print("\n   FAILED: onnx2ncnn produced invalid output!")
+        print("   onnx2ncnn likely crashed (protobuf error or unsupported op).")
+        print("   ncnn 20240820 may not support this model's ONNX ops.")
+        print("   Consider using PNNX as an alternative.")
         sys.exit(1)
 
     fp32_size = os.path.getsize(fp32_bin)
-    if fp32_size == 0:
-        print("   FAILED: .bin file is 0 bytes — onnx2ncnn conversion failed!")
-        print("   The model may have unsupported ops for this ncnn version.")
-        sys.exit(1)
-
     print(f"   FP32 OK: param={os.path.getsize(fp32_param) / 1024:.1f} KB, "
           f"bin={fp32_size / 1024 / 1024:.1f} MB")
 
     # 3. FP32 -> FP16
-    print("\n3. Converting to FP16...")
+    print("\n3. Converting to FP16 via ncnnoptimize...")
     fp16_param = "animegan_fp16.param"
     fp16_bin = "animegan_fp16.bin"
 
@@ -90,7 +97,8 @@ def main():
 
     ret = run_cmd([ncnnoptimize, fp32_param, fp32_bin, fp16_param, fp16_bin, "65536"])
 
-    if os.path.exists(fp16_param) and os.path.exists(fp16_bin) and os.path.getsize(fp16_bin) > 0:
+    if (os.path.exists(fp16_param) and os.path.exists(fp16_bin)
+            and os.path.getsize(fp16_bin) > 0):
         fp16_size = os.path.getsize(fp16_bin)
         print(f"   FP16 OK: param={os.path.getsize(fp16_param) / 1024:.1f} KB, "
               f"bin={fp16_size / 1024 / 1024:.1f} MB")
