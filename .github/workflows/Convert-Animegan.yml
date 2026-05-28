@@ -1,11 +1,11 @@
-name: Convert Animegan to NCNN
+name: Convert 1 to NCNN
 
 on:
   workflow_dispatch:
 
 jobs:
   convert:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -28,18 +28,47 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libprotobuf-dev protobuf-compiler
 
+          # Lấy version mới nhất
           NCNN_VER=$(curl -s https://api.github.com/repos/Tencent/ncnn/releases/latest \
             | grep -oP '"tag_name": "\K[^"]+')
           echo "Latest ncnn version: $NCNN_VER"
 
-          wget -q "https://github.com/Tencent/ncnn/releases/download/${NCNN_VER}/ncnn-${NCNN_VER}-ubuntu-2204.zip"
-          unzip -q "ncnn-${NCNN_VER}-ubuntu-2204.zip"
+          # Liệt kê tất cả assets để debug
+          echo "--- Available assets ---"
+          curl -s "https://api.github.com/repos/Tencent/ncnn/releases/latest" \
+            | grep '"name"' | grep -i ubuntu || true
 
-          sudo cp "ncnn-${NCNN_VER}-ubuntu-2204/bin/onnx2ncnn" /usr/local/bin/
-          sudo cp "ncnn-${NCNN_VER}-ubuntu-2204/bin/ncnnoptimize" /usr/local/bin/
+          # Tìm asset phù hợp — ưu tiên ubuntu-2404, rồi ubuntu-2204, rồi ubuntu chung
+          ZIP_NAME=""
+          for pattern in "ubuntu-2404" "ubuntu-2204" "ubuntu-2004" "ubuntu"; do
+            ZIP_NAME=$(curl -s "https://api.github.com/repos/Tencent/ncnn/releases/latest" \
+              | grep -oP '"name": "\K[^"]*' | grep -i "${pattern}" | grep '\.zip$' | head -1)
+            if [ -n "$ZIP_NAME" ]; then
+              echo "Found asset: $ZIP_NAME"
+              break
+            fi
+          done
+
+          if [ -z "$ZIP_NAME" ]; then
+            echo "ERROR: No ubuntu zip found in release $NCNN_VER"
+            curl -s "https://api.github.com/repos/Tencent/ncnn/releases/latest" \
+              | grep '"name":' || true
+            exit 1
+          fi
+
+          # Tải về
+          wget -q "https://github.com/Tencent/ncnn/releases/download/${NCNN_VER}/${ZIP_NAME}"
+          unzip -q "$ZIP_NAME"
+
+          # Tìm thư mục giải nén
+          NCNN_DIR=$(ls -d ncnn-*/ 2>/dev/null | head -1)
+          echo "Extracted dir: $NCNN_DIR"
+
+          sudo cp "${NCNN_DIR}bin/onnx2ncnn" /usr/local/bin/
+          sudo cp "${NCNN_DIR}bin/ncnnoptimize" /usr/local/bin/
           sudo chmod +x /usr/local/bin/onnx2ncnn /usr/local/bin/ncnnoptimize
 
-          onnx2ncnn 2>&1 | head -1 || true
+          onnx2ncnn 2>&1 | head -2 || true
           echo "---"
           ldd /usr/local/bin/onnx2ncnn | grep "not found" && echo "MISSING LIBS!" || echo "onnx2ncnn OK"
           ldd /usr/local/bin/ncnnoptimize | grep "not found" && echo "MISSING LIBS!" || echo "ncnnoptimize OK"
