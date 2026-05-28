@@ -1,4 +1,4 @@
-name: Convert Models to NCNN
+name: Convert AnimeGan to NCNN
 
 on:
   workflow_dispatch:
