@@ -1,6 +1,5 @@
 name: Run Cartoonify OpenCV
 
-# Chạy thủ công bằng cách bấm nút trên GitHub
 on:
   workflow_dispatch:
 
@@ -10,10 +9,10 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4  # Nâng cấp lên v4
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5  # Nâng cấp lên v5
       with:
         python-version: '3.10'
 
@@ -22,14 +21,13 @@ jobs:
 
     - name: Download Sample Image
       run: |
-        # Tải ảnh mẫu Lena (ảnh kinh điển của OpenCV) làm ảnh đầu vào
         wget https://raw.githubusercontent.com/opencv/opencv/master/samples/data/lena.jpg -O input.jpg
 
     - name: Run Cartoonify Script
       run: python cartoon.py input.jpg output_cartoon.jpg
 
     - name: Upload Cartoon Image as Artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4  # Nâng cấp lên v4 để khắc phục lỗi
       with:
         name: cartoon-result
         path: output_cartoon.jpg
