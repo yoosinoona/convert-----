@@ -1,0 +1,35 @@
+name: Run Cartoonify OpenCV
+
+# Chạy thủ công bằng cách bấm nút trên GitHub
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install OpenCV Headless
+      run: pip install opencv-python-headless
+
+    - name: Download Sample Image
+      run: |
+        # Tải ảnh mẫu Lena (ảnh kinh điển của OpenCV) làm ảnh đầu vào
+        wget https://raw.githubusercontent.com/opencv/opencv/master/samples/data/lena.jpg -O input.jpg
+
+    - name: Run Cartoonify Script
+      run: python cartoon.py input.jpg output_cartoon.jpg
+
+    - name: Upload Cartoon Image as Artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: cartoon-result
+        path: output_cartoon.jpg
