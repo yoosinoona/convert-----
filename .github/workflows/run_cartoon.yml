@@ -1,4 +1,4 @@
-name: Run Cartoonify OpenCV
+name: Run AI Style Transfer ONNX
 
 on:
   workflow_dispatch:
@@ -9,25 +9,30 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4  # Nâng cấp lên v4
+      uses: actions/checkout@v4
 
     - name: Set up Python
-      uses: actions/setup-python@v5  # Nâng cấp lên v5
+      uses: actions/setup-python@v5
       with:
         python-version: '3.10'
 
-    - name: Install OpenCV Headless
+    - name: Install OpenCV
       run: pip install opencv-python-headless
 
     - name: Download Sample Image
       run: |
         wget https://raw.githubusercontent.com/opencv/opencv/master/samples/data/lena.jpg -O input.jpg
 
-    - name: Run Cartoonify Script
-      run: python cartoon.py input.jpg output_cartoon.jpg
+    - name: Download Pre-trained ONNX Model (Candy Style)
+      run: |
+        # Tải model Candy (phong cách nghệ thuật đường nét + màu sắc rực rỡ, BSD License)
+        wget https://github.com/onnx/models/raw/main/validated/vision/style_transfer/fast_neural_style/model/candy-9.onnx -O model.onnx
 
-    - name: Upload Cartoon Image as Artifact
-      uses: actions/upload-artifact@v4  # Nâng cấp lên v4 để khắc phục lỗi
+    - name: Run Neural Style Transfer
+      run: python neural_style.py input.jpg output_neural.jpg model.onnx
+
+    - name: Upload Result Image
+      uses: actions/upload-artifact@v4
       with:
-        name: cartoon-result
-        path: output_cartoon.jpg
+        name: neural-style-result
+        path: output_neural.jpg
