@@ -1,4 +1,4 @@
-name: Convert 2xParagonSR_Nano_gan to NCNN (via onnx2ncnn)
+name: Convert 2xParagonSR_Nano_gan to NCNN (Pre-built OS-matched)
 
 on:
   workflow_dispatch:
@@ -12,48 +12,53 @@ jobs:
 
       - name: Download ONNX from Phhofm Release
         run: |
-          echo "️ Đang tải file ONNX..."
+          echo "⬇️ Đang tải file ONNX..."
           wget -O 2xParagonSR_Nano_gan.onnx https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp16.onnx
           echo "✅ Tải ONNX thành công!"
 
-      - name: Install Dependencies & Setup Python
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential git cmake libprotobuf-dev protobuf-compiler wget python3-pip
-          pip3 install onnx onnxsim
-
-      - name: Build NCNN Tools from Source
-        run: |
-          echo "📥 Đang clone và build NCNN tools (mất khoảng 2-3 phút)..."
-          git clone --depth 1 --recursive https://github.com/Tencent/ncnn.git
-          cd ncnn
-          mkdir build && cd build
-          
-          # Cấu hình CMake: Chỉ build tools, tắt ví dụ và benchmark cho nhanh
-          cmake -DNCNN_BUILD_TOOLS=ON -DNCNN_BUILD_EXAMPLES=OFF -DNCNN_BUILD_BENCHMARK=OFF ..
-          make -j$(nproc)
-          
-          echo "✅ Build hoàn tất! Đang kiểm tra file binary..."
-          # Tự động tìm đường dẫn chính xác của 2 file tools
-          find . -type f -executable \( -name "onnx2ncnn" -o -name "ncnnoptimize" \) | tee /tmp/ncnn_tools.txt
-
-      - name: Simplify ONNX (Bắt buộc để onnx2ncnn không bị lỗi)
-        run: |
-          echo "🔹 Đang simplify ONNX với onnxsim..."
+      - name: Setup Python & Install onnxsim
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: |
+          echo "📦 Đang cài đặt onnxsim..."
+          pip install onnxsim
+          echo "✅ Simplify ONNX..."
           python3 -m onnxsim 2xParagonSR_Nano_gan.onnx 2xParagonSR_Nano_gan_sim.onnx || {
-            echo "️ onnxsim thất bại, dùng file gốc."
+            echo "⚠️ onnxsim thất bại, dùng file gốc."
             cp 2xParagonSR_Nano_gan.onnx 2xParagonSR_Nano_gan_sim.onnx
           }
 
-      - name: Convert ONNX to NCNN using onnx2ncnn
+      - name: Download NCNN Tools (Matching OS Version)
         run: |
-          echo " Bước 1: Convert sang NCNN..."
+          echo "🔍 Đang xác định phiên bản Ubuntu của Runner..."
+          # Tự động lấy version OS (ví dụ: 2204, 2404)
+          OS_VER=$(lsb_release -rs | tr -d '.')
+          echo "✅ Phiên bản Ubuntu: $OS_VER"
           
-          # Tự động lấy đường dẫn tuyệt đối của file onnx2ncnn vừa build
-          ONNX2NCNN=$(realpath $(find ncnn/build -type f -executable -name "onnx2ncnn" | head -1))
-          echo "✅ Đang dùng: $ONNX2NCNN"
+          # Tải bản pre-built khớp chính xác với OS để tránh lỗi libprotobuf
+          URL="https://github.com/Tencent/ncnn/releases/download/20240410/ncnn-20240410-ubuntu-${OS_VER}.zip"
+          echo "⬇️ Đang tải từ: $URL"
           
-          $ONNX2NCNN 2xParagonSR_Nano_gan_sim.onnx model.param model.bin
+          wget -q "$URL" -O ncnn-tools.zip || {
+              echo "⚠️ Không tìm thấy bản cho $OS_VER, chuyển sang fallback Ubuntu 2204..."
+              wget -q "https://github.com/Tencent/ncnn/releases/download/20240410/ncnn-20240410-ubuntu-2204.zip" -O ncnn-tools.zip
+          }
+          
+          unzip -q ncnn-tools.zip
+          chmod +x ncnn-20240410-ubuntu-*/bin/onnx2ncnn
+          chmod +x ncnn-20240410-ubuntu-*/bin/ncnnoptimize
+          echo "✅ Tải và giải nén NCNN tools thành công!"
+
+      - name: Convert ONNX to NCNN
+        run: |
+          echo "🔹 Bước 1: Convert sang NCNN..."
+          
+          # Tự động tìm thư mục bin chứa tools
+          BIN_DIR=$(find . -maxdepth 2 -type d -name "bin" | grep ncnn | head -1)
+          echo "📂 Sử dụng thư mục tools: $BIN_DIR"
+          
+          $BIN_DIR/onnx2ncnn 2xParagonSR_Nano_gan_sim.onnx model.param model.bin
           
           # Fix lỗi DepthToSpace -> PixelShuffle (thường gặp ở model SR)
           sed -i 's/DepthToSpace/PixelShuffle/g' model.param
@@ -63,14 +68,12 @@ jobs:
 
       - name: Optimize NCNN Model (FP16)
         run: |
-          echo "🔹 Bước 2: Optimize sang FP16 (Giảm dung lượng, tăng tốc)..."
+          echo "🔹 Bước 2: Optimize sang FP16 (Giảm dung lượng, tăng tốc GPU mobile)..."
           
-          # Tự động lấy đường dẫn tuyệt đối của file ncnnoptimize
-          NCNNOPTIMIZE=$(realpath $(find ncnn/build -type f -executable -name "ncnnoptimize" | head -1))
-          echo "✅ Đang dùng: $NCNNOPTIMIZE"
+          BIN_DIR=$(find . -maxdepth 2 -type d -name "bin" | grep ncnn | head -1)
           
-          # Flag 1: Ép weights xuống FP16 (giảm 50% dung lượng, tăng tốc GPU mobile)
-          $NCNNOPTIMIZE model.param model.bin model_opt.param model_opt.bin 1
+          # Flag 1: Ép weights sang FP16 packed
+          $BIN_DIR/ncnnoptimize model.param model.bin model_opt.param model_opt.bin 1
           
           echo "✅ Hoàn tất! File kết quả cuối cùng:"
           ls -lh model_opt.param model_opt.bin
