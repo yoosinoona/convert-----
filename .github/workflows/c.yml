@@ -220,7 +220,7 @@ jobs:
 
       - name: Upload to Release (if tag exists)
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softpos/action-gh-release@v2
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             1x-SkinContrast-SuperUltraCompact-NCNN.zip
