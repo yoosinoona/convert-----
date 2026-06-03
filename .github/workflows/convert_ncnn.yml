@@ -1,4 +1,4 @@
-name: Convert 2xParagonSR_Nano_gan to NCNN (via PNNX Python)
+name: Convert 2xParagonSR_Nano_gan to NCNN (via PNNX CLI)
 
 on:
   workflow_dispatch:
@@ -21,33 +21,18 @@ jobs:
         with:
           python-version: '3.10'
       - run: |
-          echo "📦 Đang cài đặt PNNX Python package..."
-          pip install pnnx onnx onnxsim
+          echo "📦 Đang cài đặt PNNX..."
+          pip install pnnx onnxsim
           echo "✅ Cài đặt PNNX thành công!"
-          pnnx --version || echo "PNNX đã sẵn sàng"
 
-      - name: Convert ONNX to NCNN using PNNX Python API
+      - name: Convert ONNX to NCNN using PNNX CLI
         run: |
-          echo "🔹 Đang convert bằng PNNX Python API..."
+          echo "🔹 Đang convert bằng PNNX CLI..."
           
-          # Tạo Python script để convert
-          cat > convert.py << 'EOF'
-          import pnnx
-          import torch
+          # PNNX CLI nhận file ONNX trực tiếp
+          pnnx 2xParagonSR_Nano_gan.onnx inputshape=[1,3,256,256]
           
-          print("Đang convert model...")
-          # PNNX sẽ tự động tạo file .ncnn.param và .ncnn.bin
-          pnnx.export(
-              "2xParagonSR_Nano_gan.onnx",
-              inputs=torch.randn(1, 3, 256, 256),
-              customop=""
-          )
-          print("✅ Convert thành công!")
-          EOF
-          
-          python convert.py
-          
-          echo "📊 File NCNN kết quả:"
+          echo "✅ Convert thành công! File NCNN kết quả:"
           ls -lh *.ncnn.param *.ncnn.bin
 
       - name: Upload NCNN Artifacts
