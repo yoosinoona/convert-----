@@ -1,4 +1,4 @@
-name: Convert 2xParagonSR_Nano_gan to NCNN (via PNNX CLI)
+name: Convert 2xParagonSR_Nano_gan to NCNN (via onnx2ncnn)
 
 on:
   workflow_dispatch:
@@ -12,37 +12,74 @@ jobs:
 
       - name: Download ONNX from Phhofm Release
         run: |
-          echo "⬇️ Đang tải file ONNX..."
+          echo "️ Đang tải file ONNX..."
           wget -O 2xParagonSR_Nano_gan.onnx https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp16.onnx
           echo "✅ Tải ONNX thành công!"
 
-      - name: Setup Python & Install PNNX
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-      - run: |
-          echo " Đang cài đặt PNNX..."
-          pip install pnnx onnxsim
-          echo "✅ Cài đặt PNNX thành công!"
-
-      - name: Convert ONNX to NCNN using PNNX CLI
+      - name: Install Dependencies & Setup Python
         run: |
-          echo " Đang convert bằng PNNX CLI..."
+          sudo apt-get update
+          sudo apt-get install -y build-essential git cmake libprotobuf-dev protobuf-compiler wget python3-pip
+          pip3 install onnx onnxsim
+
+      - name: Build NCNN Tools from Source
+        run: |
+          echo "📥 Đang clone và build NCNN tools (mất khoảng 2-3 phút)..."
+          git clone --depth 1 --recursive https://github.com/Tencent/ncnn.git
+          cd ncnn
+          mkdir build && cd build
           
-          # Chỉ định rõ input shape là FP16 (khớp với model FP16)
-          # Thêm inputshape2 để PNNX biết model hỗ trợ dynamic shape
-          pnnx 2xParagonSR_Nano_gan.onnx \
-            inputshape="[1,3,256,256]f16" \
-            inputshape2="[1,3,512,512]f16"
+          # Cấu hình CMake: Chỉ build tools, tắt ví dụ và benchmark cho nhanh
+          cmake -DNCNN_BUILD_TOOLS=ON -DNCNN_BUILD_EXAMPLES=OFF -DNCNN_BUILD_BENCHMARK=OFF ..
+          make -j$(nproc)
           
-          echo "✅ Convert thành công! File NCNN kết quả:"
-          ls -lh *.ncnn.param *.ncnn.bin
+          echo "✅ Build hoàn tất! Đang kiểm tra file binary..."
+          # Tự động tìm đường dẫn chính xác của 2 file tools
+          find . -type f -executable \( -name "onnx2ncnn" -o -name "ncnnoptimize" \) | tee /tmp/ncnn_tools.txt
+
+      - name: Simplify ONNX (Bắt buộc để onnx2ncnn không bị lỗi)
+        run: |
+          echo "🔹 Đang simplify ONNX với onnxsim..."
+          python3 -m onnxsim 2xParagonSR_Nano_gan.onnx 2xParagonSR_Nano_gan_sim.onnx || {
+            echo "️ onnxsim thất bại, dùng file gốc."
+            cp 2xParagonSR_Nano_gan.onnx 2xParagonSR_Nano_gan_sim.onnx
+          }
+
+      - name: Convert ONNX to NCNN using onnx2ncnn
+        run: |
+          echo " Bước 1: Convert sang NCNN..."
+          
+          # Tự động lấy đường dẫn tuyệt đối của file onnx2ncnn vừa build
+          ONNX2NCNN=$(realpath $(find ncnn/build -type f -executable -name "onnx2ncnn" | head -1))
+          echo "✅ Đang dùng: $ONNX2NCNN"
+          
+          $ONNX2NCNN 2xParagonSR_Nano_gan_sim.onnx model.param model.bin
+          
+          # Fix lỗi DepthToSpace -> PixelShuffle (thường gặp ở model SR)
+          sed -i 's/DepthToSpace/PixelShuffle/g' model.param
+          
+          echo " Kích thước file sau khi convert:"
+          ls -lh model.param model.bin
+
+      - name: Optimize NCNN Model (FP16)
+        run: |
+          echo "🔹 Bước 2: Optimize sang FP16 (Giảm dung lượng, tăng tốc)..."
+          
+          # Tự động lấy đường dẫn tuyệt đối của file ncnnoptimize
+          NCNNOPTIMIZE=$(realpath $(find ncnn/build -type f -executable -name "ncnnoptimize" | head -1))
+          echo "✅ Đang dùng: $NCNNOPTIMIZE"
+          
+          # Flag 1: Ép weights xuống FP16 (giảm 50% dung lượng, tăng tốc GPU mobile)
+          $NCNNOPTIMIZE model.param model.bin model_opt.param model_opt.bin 1
+          
+          echo "✅ Hoàn tất! File kết quả cuối cùng:"
+          ls -lh model_opt.param model_opt.bin
 
       - name: Upload NCNN Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: 2xParagonSR_Nano_gan_ncnn_pnnx
+          name: 2xParagonSR_Nano_gan_ncnn_final
           path: |
-            *.ncnn.param
-            *.ncnn.bin
+            model_opt.param
+            model_opt.bin
           retention-days: 90
