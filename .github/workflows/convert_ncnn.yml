@@ -31,34 +31,37 @@ jobs:
           git clone --recursive https://github.com/Tencent/ncnn.git
           cd ncnn
           mkdir build && cd build
-          # Chỉ build các tools cần thiết để tiết kiệm thời gian
+          # Bật build tools, tắt examples và benchmark để build nhanh hơn
           cmake -DNCNN_BUILD_TOOLS=ON -DNCNN_BUILD_EXAMPLES=OFF -DNCNN_BUILD_BENCHMARK=OFF ..
-          make -j$(nproc) onnx2ncnn ncnnoptimize
+          # SỬA LỖI: Build tất cả target thay vì gọi tên cụ thể
+          make -j$(nproc) 
 
       - name: Convert ONNX to NCNN
         run: |
-          # Tên file ONNX của bạn (hãy đổi nếu bạn để tên khác)
           ONNX_FILE="2xParagonSR_Nano_gan.onnx"
           
           if [ ! -f "$ONNX_FILE" ]; then
-            echo "❌ Lỗi: Không tìm thấy file $ONNX_FILE. Hãy upload file ONNX lên root của repository!"
+            echo "❌ Lỗi: Không tìm thấy file $ONNX_FILE."
             exit 1
           fi
 
-          echo "🔹 Bước 1: Simplify ONNX với onnxsim..."
+          echo "🔹 Bước 1: Simplify ONNX..."
           python -m onnxsim "$ONNX_FILE" simplified.onnx || {
-            echo "⚠️ onnxsim thất bại, sẽ sử dụng file ONNX gốc."
+            echo "⚠️ onnxsim thất bại, dùng file gốc."
             cp "$ONNX_FILE" simplified.onnx
           }
 
-          echo "🔹 Bước 2: Convert sang NCNN (.param và .bin)..."
-          ./ncnn/build/tools/onnx/onnx2ncnn simplified.onnx model.param model.bin
+          echo "🔹 Bước 2: Convert sang NCNN..."
+          # Đường dẫn đến tools sau khi build toàn bộ
+          ./ncnn/build/tools/onnx2ncnn simplified.onnx model.param model.bin
 
-          # Fix lỗi DepthToSpace thường gặp ở các model Super-Resolution
+          # Fix lỗi DepthToSpace -> PixelShuffle
           sed -i 's/DepthToSpace/PixelShuffle/g' model.param
 
-          echo "🔹 Bước 3: Optimize sang FP16 (Giảm dung lượng, tăng tốc độ)..."
+          echo "🔹 Bước 3: Optimize sang FP16..."
           ./ncnn/build/tools/ncnnoptimize model.param model.bin model_opt.param model_opt.bin 1
+          
+          echo "✅ Convert thành công!"
 
       - name: Upload NCNN Artifacts
         uses: actions/upload-artifact@v4
