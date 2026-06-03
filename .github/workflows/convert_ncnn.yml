@@ -6,16 +6,9 @@ on:
 jobs:
   convert:
     runs-on: ubuntu-latest
-    container: ubuntu:20.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          apt-get update
-          apt-get install -y wget unzip python3 python3-pip git
-          pip3 install onnx onnxsim
 
       - name: Download ONNX from Phhofm Release
         run: |
@@ -24,18 +17,28 @@ jobs:
           echo "✅ Tải thành công!"
           ls -lh model.onnx
 
-      - name: Download Pre-built NCNN Tools
+      - name: Setup Python & Install onnxsim
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install onnx onnxsim
+
+      - name: Build NCNN tools from source
         run: |
-          echo "⬇️ Đang tải bộ công cụ NCNN build sẵn..."
-          wget -q https://github.com/Tencent/ncnn/releases/download/20240410/ncnn-20240410-ubuntu-2004.zip
-          unzip -q ncnn-20240410-ubuntu-2004.zip
-          chmod +x ncnn-20240410-ubuntu-2004/bin/onnx2ncnn
-          chmod +x ncnn-20240410-ubuntu-2004/bin/ncnnoptimize
+          echo "🔨 Đang build NCNN từ source (đảm bảo tương thích)..."
+          sudo apt-get update
+          sudo apt-get install -y build-essential git cmake libprotobuf-dev protobuf-compiler
+          git clone --depth 1 --recursive https://github.com/Tencent/ncnn.git
+          cd ncnn
+          mkdir build && cd build
+          cmake -DNCNN_BUILD_TOOLS=ON -DNCNN_BUILD_EXAMPLES=OFF -DNCNN_BUILD_BENCHMARK=OFF ..
+          make -j$(nproc)
+          echo "✅ Build NCNN thành công!"
 
       - name: Simplify ONNX
         run: |
           echo "🔹 Bước 1: Simplify ONNX với onnxsim..."
-          python3 -m onnxsim model.onnx model_sim.onnx || {
+          python -m onnxsim model.onnx model_sim.onnx || {
             echo "⚠️ onnxsim thất bại, dùng file gốc."
             cp model.onnx model_sim.onnx
           }
@@ -43,15 +46,19 @@ jobs:
       - name: Convert to NCNN
         run: |
           echo "🔹 Bước 2: Convert sang NCNN (.param và .bin)..."
-          ./ncnn-20240410-ubuntu-2004/bin/onnx2ncnn model_sim.onnx model.param model.bin
+          ./ncnn/build/tools/onnx2ncnn model_sim.onnx model.param model.bin
+          
+          # Fix lỗi DepthToSpace -> PixelShuffle
           sed -i 's/DepthToSpace/PixelShuffle/g' model.param
+          
           echo "📊 Kích thước file sau khi convert:"
           ls -lh model.param model.bin
 
       - name: Optimize NCNN Model
         run: |
           echo "🔹 Bước 3: Optimize cấu trúc NCNN..."
-          ./ncnn-20240410-ubuntu-2004/bin/ncnnoptimize model.param model.bin model_opt.param model_opt.bin 0
+          ./ncnn/build/tools/ncnnoptimize model.param model.bin model_opt.param model_opt.bin 0
+          
           echo "✅ Hoàn tất! File kết quả:"
           ls -lh model_opt.param model_opt.bin
 
