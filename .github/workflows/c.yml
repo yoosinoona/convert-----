@@ -31,7 +31,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install spandrel onnx onnxruntime numpy
+          pip install spandrel onnx onnxruntime numpy onnxscript
 
       - name: Verify model file
         run: |
