@@ -1,0 +1,70 @@
+name: Convert ONNX to NCNN
+
+on:
+  # Cho phép chạy thủ công từ tab Actions
+  workflow_dispatch:
+  # Tự động chạy khi có file .onnx được push lên repo
+  push:
+    paths:
+      - '*.onnx'
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Python dependencies (onnxsim)
+        run: |
+          pip install onnx onnxsim
+
+      - name: Build NCNN tools from source
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git cmake libprotobuf-dev protobuf-compiler
+          git clone --recursive https://github.com/Tencent/ncnn.git
+          cd ncnn
+          mkdir build && cd build
+          # Chỉ build các tools cần thiết để tiết kiệm thời gian
+          cmake -DNCNN_BUILD_TOOLS=ON -DNCNN_BUILD_EXAMPLES=OFF -DNCNN_BUILD_BENCHMARK=OFF ..
+          make -j$(nproc) onnx2ncnn ncnnoptimize
+
+      - name: Convert ONNX to NCNN
+        run: |
+          # Tên file ONNX của bạn (hãy đổi nếu bạn để tên khác)
+          ONNX_FILE="2xParagonSR_Nano_gan.onnx"
+          
+          if [ ! -f "$ONNX_FILE" ]; then
+            echo "❌ Lỗi: Không tìm thấy file $ONNX_FILE. Hãy upload file ONNX lên root của repository!"
+            exit 1
+          fi
+
+          echo "🔹 Bước 1: Simplify ONNX với onnxsim..."
+          python -m onnxsim "$ONNX_FILE" simplified.onnx || {
+            echo "⚠️ onnxsim thất bại, sẽ sử dụng file ONNX gốc."
+            cp "$ONNX_FILE" simplified.onnx
+          }
+
+          echo "🔹 Bước 2: Convert sang NCNN (.param và .bin)..."
+          ./ncnn/build/tools/onnx/onnx2ncnn simplified.onnx model.param model.bin
+
+          # Fix lỗi DepthToSpace thường gặp ở các model Super-Resolution
+          sed -i 's/DepthToSpace/PixelShuffle/g' model.param
+
+          echo "🔹 Bước 3: Optimize sang FP16 (Giảm dung lượng, tăng tốc độ)..."
+          ./ncnn/build/tools/ncnnoptimize model.param model.bin model_opt.param model_opt.bin 1
+
+      - name: Upload NCNN Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: 2xParagonSR_Nano_gan_ncnn_fp16
+          path: |
+            model_opt.param
+            model_opt.bin
+          retention-days: 7
