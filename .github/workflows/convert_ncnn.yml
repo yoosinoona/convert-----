@@ -25,7 +25,7 @@ jobs:
 
       - name: Build NCNN tools from source
         run: |
-          echo "🔨 Đang build NCNN từ source (đảm bảo tương thích)..."
+          echo "🔨 Đang build NCNN từ source..."
           sudo apt-get update
           sudo apt-get install -y build-essential git cmake libprotobuf-dev protobuf-compiler
           git clone --depth 1 --recursive https://github.com/Tencent/ncnn.git
@@ -33,7 +33,18 @@ jobs:
           mkdir build && cd build
           cmake -DNCNN_BUILD_TOOLS=ON -DNCNN_BUILD_EXAMPLES=OFF -DNCNN_BUILD_BENCHMARK=OFF ..
           make -j$(nproc)
-          echo "✅ Build NCNN thành công!"
+          
+          echo "✅ Build hoàn tất! Đang kiểm tra file binary..."
+          # Tìm file onnx2ncnn và ncnnoptimize
+          find . -name "onnx2ncnn" -o -name "ncnnoptimize" | tee /tmp/ncnn_tools.txt
+          
+          if [ ! -s /tmp/ncnn_tools.txt ]; then
+            echo "❌ LỖI: Không tìm thấy file binary sau khi build!"
+            exit 1
+          fi
+          
+          echo "✅ Tìm thấy các tools:"
+          cat /tmp/ncnn_tools.txt
 
       - name: Simplify ONNX
         run: |
@@ -46,7 +57,17 @@ jobs:
       - name: Convert to NCNN
         run: |
           echo "🔹 Bước 2: Convert sang NCNN (.param và .bin)..."
-          ./ncnn/build/tools/onnx2ncnn model_sim.onnx model.param model.bin
+          
+          # Tìm đường dẫn chính xác của onnx2ncnn
+          ONNX2NCNN=$(find ncnn/build -name "onnx2ncnn" -type f | head -1)
+          
+          if [ -z "$ONNX2NCNN" ]; then
+            echo "❌ Không tìm thấy onnx2ncnn!"
+            exit 1
+          fi
+          
+          echo "✅ Sử dụng: $ONNX2NCNN"
+          $ONNX2NCNN model_sim.onnx model.param model.bin
           
           # Fix lỗi DepthToSpace -> PixelShuffle
           sed -i 's/DepthToSpace/PixelShuffle/g' model.param
@@ -57,7 +78,17 @@ jobs:
       - name: Optimize NCNN Model
         run: |
           echo "🔹 Bước 3: Optimize cấu trúc NCNN..."
-          ./ncnn/build/tools/ncnnoptimize model.param model.bin model_opt.param model_opt.bin 0
+          
+          # Tìm đường dẫn chính xác của ncnnoptimize
+          NCNNOPTIMIZE=$(find ncnn/build -name "ncnnoptimize" -type f | head -1)
+          
+          if [ -z "$NCNNOPTIMIZE" ]; then
+            echo "❌ Không tìm thấy ncnnoptimize!"
+            exit 1
+          fi
+          
+          echo "✅ Sử dụng: $NCNNOPTIMIZE"
+          $NCNNOPTIMIZE model.param model.bin model_opt.param model_opt.bin 0
           
           echo "✅ Hoàn tất! File kết quả:"
           ls -lh model_opt.param model_opt.bin
