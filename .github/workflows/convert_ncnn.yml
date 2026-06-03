@@ -1,4 +1,4 @@
-name: Convert 2xParagonSR_Nano_gan to NCNN (Build PNNX from Source)
+name: Convert 2xParagonSR_Nano_gan to NCNN (via PNNX Python)
 
 on:
   workflow_dispatch:
@@ -16,50 +16,38 @@ jobs:
           wget -O 2xParagonSR_Nano_gan.onnx https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp16.onnx
           echo "✅ Tải ONNX thành công!"
 
-      - name: Install Dependencies for PNNX Build
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential git cmake wget unzip python3-pip
-          pip3 install onnx onnxsim
+      - name: Setup Python & Install PNNX
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: |
+          echo "📦 Đang cài đặt PNNX Python package..."
+          pip install pnnx onnx onnxsim
+          echo "✅ Cài đặt PNNX thành công!"
+          pnnx --version || echo "PNNX đã sẵn sàng"
 
-      - name: Clone PNNX Repository
+      - name: Convert ONNX to NCNN using PNNX Python API
         run: |
-          echo "📥 Đang clone repo PNNX từ GitHub..."
-          git clone --recursive https://github.com/nihui/pnnx.git
-          cd pnnx
-          # Clone PyTorch (LibTorch) - PNNX cần thư viện này để build
-          echo " Đang tải LibTorch (CPU, ~500MB)..."
-          # Dùng link LibTorch CPU bản stable mới nhất (không cần CUDA)
-          wget -q https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-2.2.2%2Bcpu.zip -O libtorch.zip
-          unzip -q libtorch.zip
-          echo "✅ LibTorch sẵn sàng!"
-
-      - name: Build PNNX
-        run: |
-          echo "🔨 Đang build PNNX từ source (mất khoảng 5-8 phút)..."
-          cd pnnx/src
-          # Set biến môi trường trỏ đến LibTorch vừa tải
-          export Torch_DIR=$(pwd)/../libtorch/share/cmake/Torch
+          echo "🔹 Đang convert bằng PNNX Python API..."
           
-          mkdir build && cd build
-          cmake ..
-          make -j$(nproc)
+          # Tạo Python script để convert
+          cat > convert.py << 'EOF'
+          import pnnx
+          import torch
           
-          echo "✅ Build PNNX thành công!"
-          ls -lh pnnx
-
-      - name: Simplify ONNX
-        run: |
-          python3 -m onnxsim 2xParagonSR_Nano_gan.onnx 2xParagonSR_Nano_gan_sim.onnx || {
-            cp 2xParagonSR_Nano_gan.onnx 2xParagonSR_Nano_gan_sim.onnx
-          }
-
-      - name: Convert ONNX to NCNN using PNNX
-        run: |
-          echo "🔹 Đang convert bằng PNNX..."
-          ./pnnx/src/build/pnnx 2xParagonSR_Nano_gan_sim.onnx inputshape=[1,3,256,256]
+          print("Đang convert model...")
+          # PNNX sẽ tự động tạo file .ncnn.param và .ncnn.bin
+          pnnx.export(
+              "2xParagonSR_Nano_gan.onnx",
+              inputs=torch.randn(1, 3, 256, 256),
+              customop=""
+          )
+          print("✅ Convert thành công!")
+          EOF
           
-          echo "✅ Convert thành công! File kết quả:"
+          python convert.py
+          
+          echo "📊 File NCNN kết quả:"
           ls -lh *.ncnn.param *.ncnn.bin
 
       - name: Upload NCNN Artifacts
@@ -67,6 +55,6 @@ jobs:
         with:
           name: 2xParagonSR_Nano_gan_ncnn_pnnx
           path: |
-            2xParagonSR_Nano_gan.ncnn.param
-            2xParagonSR_Nano_gan.ncnn.bin
+            *.ncnn.param
+            *.ncnn.bin
           retention-days: 90
