@@ -11,10 +11,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python & Simplify ONNX
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+
+      - name: Install deps, Download & Simplify ONNX
         run: |
           pip install onnx onnxsim
           wget -O 2xParagonSR_Nano_gan.onnx https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp16.onnx
@@ -31,7 +33,7 @@ jobs:
           echo "🔹 Đang convert trực tiếp từ ONNX FP16 sang NCNN..."
           ./ncnn-20240820-ubuntu-2204/bin/onnx2ncnn 2xParagonSR_Nano_gan_sim.onnx 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
           
-          # Fix duy nhất cần thiết: ONNX opset 18 dùng DepthToSpace, NCNN cần PixelShuffle
+          # Bắt buộc phải có vì opset 18 export DepthToSpace thay vì PixelShuffle
           sed -i 's/DepthToSpace/PixelShuffle/g' 2xParagonSR_Nano_gan.param
           
           echo "✅ Hoàn tất! Kết quả:"
