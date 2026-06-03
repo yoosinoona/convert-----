@@ -1,7 +1,6 @@
 name: Convert 2xParagonSR_Nano_gan to NCNN
 
 on:
-  # Chỉ cần bấm nút Run workflow thủ công, không cần push file nữa
   workflow_dispatch:
 
 jobs:
@@ -13,8 +12,12 @@ jobs:
 
       - name: Download ONNX from Phhofm Release
         run: |
-          echo "️ Đang tải file ONNX trực tiếp từ GitHub Release của tác giả..."
-          wget https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan.onnx
+          echo "⬇️ Đang tải file ONNX từ GitHub Release của tác giả..."
+          # File được tác giả khuyến nghị (FP16 sẵn, opset 18)
+          wget -O model.onnx https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp16.onnx
+          
+          echo "✅ Tải thành công!"
+          ls -lh model.onnx
 
       - name: Setup Python & Install onnxsim
         uses: actions/setup-python@v5
@@ -24,32 +27,36 @@ jobs:
 
       - name: Download Pre-built NCNN Tools
         run: |
-          echo "⬇️ Đang tải bộ công cụ NCNN build sẵn (tiết kiệm thời gian)..."
-          wget https://github.com/Tencent/ncnn/releases/download/20240410/ncnn-20240410-ubuntu-2004.zip
-          unzip ncnn-20240410-ubuntu-2004.zip
+          echo "⬇️ Đang tải bộ công cụ NCNN build sẵn..."
+          wget -q https://github.com/Tencent/ncnn/releases/download/20240410/ncnn-20240410-ubuntu-2004.zip
+          unzip -q ncnn-20240410-ubuntu-2004.zip
           chmod +x ncnn-20240410-ubuntu-2004/bin/onnx2ncnn
           chmod +x ncnn-20240410-ubuntu-2004/bin/ncnnoptimize
 
       - name: Simplify ONNX
         run: |
-          echo "🔹 Bước 1: Simplify ONNX..."
-          python -m onnxsim 2xParagonSR_Nano_gan.onnx 2xParagonSR_Nano_gan_sim.onnx || {
+          echo "🔹 Bước 1: Simplify ONNX với onnxsim..."
+          python -m onnxsim model.onnx model_sim.onnx || {
             echo "⚠️ onnxsim thất bại, dùng file gốc."
-            cp 2xParagonSR_Nano_gan.onnx 2xParagonSR_Nano_gan_sim.onnx
+            cp model.onnx model_sim.onnx
           }
 
       - name: Convert to NCNN
         run: |
-          echo "🔹 Bước 2: Convert sang NCNN..."
-          ./ncnn-20240410-ubuntu-2004/bin/onnx2ncnn 2xParagonSR_Nano_gan_sim.onnx model.param model.bin
+          echo "🔹 Bước 2: Convert sang NCNN (.param và .bin)..."
+          ./ncnn-20240410-ubuntu-2004/bin/onnx2ncnn model_sim.onnx model.param model.bin
           
-          # Tự động fix lỗi DepthToSpace -> PixelShuffle (thường gặp ở model SR)
+          # Fix lỗi DepthToSpace -> PixelShuffle (thường gặp ở model SR)
           sed -i 's/DepthToSpace/PixelShuffle/g' model.param
+          
+          echo "📊 Kích thước file sau khi convert:"
+          ls -lh model.param model.bin
 
-      - name: Optimize to FP16
+      - name: Optimize NCNN Model
         run: |
-          echo "🔹 Bước 3: Optimize sang FP16 (Giảm dung lượng, tăng tốc)..."
-          ./ncnn-20240410-ubuntu-2004/bin/ncnnoptimize model.param model.bin model_opt.param model_opt.bin 1
+          echo "🔹 Bước 3: Optimize cấu trúc NCNN..."
+          # File đã FP16 sẵn từ tác giả, chỉ cần optimize cấu trúc (flag 0 = giữ nguyên precision)
+          ./ncnn-20240410-ubuntu-2004/bin/ncnnoptimize model.param model.bin model_opt.param model_opt.bin 0
           
           echo "✅ Hoàn tất! File kết quả:"
           ls -lh model_opt.param model_opt.bin
@@ -57,7 +64,7 @@ jobs:
       - name: Upload NCNN Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: 2xParagonSR_Nano_gan_ncnn_fp16
+          name: 2xParagonSR_Nano_gan_ncnn
           path: |
             model_opt.param
             model_opt.bin
