@@ -1,4 +1,4 @@
-name: Convert 2xParagonSR_Nano_gan to NCNN
+name: Convert 2xParagonSR_Nano_gan to NCNN (via PNNX)
 
 on:
   workflow_dispatch:
@@ -12,92 +12,33 @@ jobs:
 
       - name: Download ONNX from Phhofm Release
         run: |
-          echo "⬇️ Đang tải file ONNX từ GitHub Release của tác giả..."
-          wget -O model.onnx https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp16.onnx
+          echo "⬇️ Đang tải file ONNX từ GitHub Release..."
+          wget -O 2xParagonSR_Nano_gan.onnx https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp16.onnx
           echo "✅ Tải thành công!"
-          ls -lh model.onnx
+          ls -lh 2xParagonSR_Nano_gan.onnx
 
-      - name: Setup Python & Install onnxsim
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-      - run: pip install onnx onnxsim
-
-      - name: Build NCNN tools from source
+      - name: Download PNNX Tool
         run: |
-          echo "🔨 Đang build NCNN từ source..."
-          sudo apt-get update
-          sudo apt-get install -y build-essential git cmake libprotobuf-dev protobuf-compiler
-          git clone --depth 1 --recursive https://github.com/Tencent/ncnn.git
-          cd ncnn
-          mkdir build && cd build
-          cmake -DNCNN_BUILD_TOOLS=ON -DNCNN_BUILD_EXAMPLES=OFF -DNCNN_BUILD_BENCHMARK=OFF ..
-          make -j$(nproc)
-          
-          echo "✅ Build hoàn tất! Đang kiểm tra file binary..."
-          # Tìm file onnx2ncnn và ncnnoptimize
-          find . -name "onnx2ncnn" -o -name "ncnnoptimize" | tee /tmp/ncnn_tools.txt
-          
-          if [ ! -s /tmp/ncnn_tools.txt ]; then
-            echo "❌ LỖI: Không tìm thấy file binary sau khi build!"
-            exit 1
-          fi
-          
-          echo "✅ Tìm thấy các tools:"
-          cat /tmp/ncnn_tools.txt
+          echo "️ Đang tải PNNX (công cụ convert chính chủ của NCNN)..."
+          wget -q https://github.com/nihui/pnnx/releases/download/20240226/pnnx-20240226-linux.zip
+          unzip -q pnnx-20240226-linux.zip
+          chmod +x pnnx
+          echo "✅ Tải PNNX thành công!"
 
-      - name: Simplify ONNX
+      - name: Convert ONNX to NCNN using PNNX
         run: |
-          echo "🔹 Bước 1: Simplify ONNX với onnxsim..."
-          python -m onnxsim model.onnx model_sim.onnx || {
-            echo "⚠️ onnxsim thất bại, dùng file gốc."
-            cp model.onnx model_sim.onnx
-          }
-
-      - name: Convert to NCNN
-        run: |
-          echo "🔹 Bước 2: Convert sang NCNN (.param và .bin)..."
+          echo "🔹 Đang convert bằng PNNX..."
+          # PNNX cần dummy input shape cho model SR. 1,3,256,256 là chuẩn.
+          ./pnnx 2xParagonSR_Nano_gan.onnx inputshape=[1,3,256,256]
           
-          # Tìm đường dẫn chính xác của onnx2ncnn
-          ONNX2NCNN=$(find ncnn/build -name "onnx2ncnn" -type f | head -1)
-          
-          if [ -z "$ONNX2NCNN" ]; then
-            echo "❌ Không tìm thấy onnx2ncnn!"
-            exit 1
-          fi
-          
-          echo "✅ Sử dụng: $ONNX2NCNN"
-          $ONNX2NCNN model_sim.onnx model.param model.bin
-          
-          # Fix lỗi DepthToSpace -> PixelShuffle
-          sed -i 's/DepthToSpace/PixelShuffle/g' model.param
-          
-          echo "📊 Kích thước file sau khi convert:"
-          ls -lh model.param model.bin
-
-      - name: Optimize NCNN Model
-        run: |
-          echo "🔹 Bước 3: Optimize cấu trúc NCNN..."
-          
-          # Tìm đường dẫn chính xác của ncnnoptimize
-          NCNNOPTIMIZE=$(find ncnn/build -name "ncnnoptimize" -type f | head -1)
-          
-          if [ -z "$NCNNOPTIMIZE" ]; then
-            echo "❌ Không tìm thấy ncnnoptimize!"
-            exit 1
-          fi
-          
-          echo "✅ Sử dụng: $NCNNOPTIMIZE"
-          $NCNNOPTIMIZE model.param model.bin model_opt.param model_opt.bin 0
-          
-          echo "✅ Hoàn tất! File kết quả:"
-          ls -lh model_opt.param model_opt.bin
+          echo "✅ Convert thành công! File kết quả:"
+          ls -lh *.ncnn.param *.ncnn.bin
 
       - name: Upload NCNN Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: 2xParagonSR_Nano_gan_ncnn
+          name: 2xParagonSR_Nano_gan_ncnn_pnnx
           path: |
-            model_opt.param
-            model_opt.bin
+            2xParagonSR_Nano_gan.ncnn.param
+            2xParagonSR_Nano_gan.ncnn.bin
           retention-days: 90
