@@ -1,88 +1,47 @@
-name: Convert 2xParagonSR_Nano_gan to NCNN (Pre-built OS-matched)
+name: Convert 2xParagonSR_Nano_gan to NCNN (Clean)
 
 on:
   workflow_dispatch:
 
 jobs:
   convert:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download ONNX from Phhofm Release
-        run: |
-          echo "⬇️ Đang tải file ONNX..."
-          wget -O 2xParagonSR_Nano_gan.onnx https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp16.onnx
-          echo "✅ Tải ONNX thành công!"
-
-      - name: Setup Python & Install onnxsim
+      - name: Setup Python & Simplify ONNX
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - run: |
-          echo "📦 Đang cài đặt onnxsim..."
-          pip install onnxsim
-          echo "✅ Simplify ONNX..."
-          python3 -m onnxsim 2xParagonSR_Nano_gan.onnx 2xParagonSR_Nano_gan_sim.onnx || {
-            echo "⚠️ onnxsim thất bại, dùng file gốc."
-            cp 2xParagonSR_Nano_gan.onnx 2xParagonSR_Nano_gan_sim.onnx
-          }
-
-      - name: Download NCNN Tools (Matching OS Version)
         run: |
-          echo "🔍 Đang xác định phiên bản Ubuntu của Runner..."
-          # Tự động lấy version OS (ví dụ: 2204, 2404)
-          OS_VER=$(lsb_release -rs | tr -d '.')
-          echo "✅ Phiên bản Ubuntu: $OS_VER"
-          
-          # Tải bản pre-built khớp chính xác với OS để tránh lỗi libprotobuf
-          URL="https://github.com/Tencent/ncnn/releases/download/20240410/ncnn-20240410-ubuntu-${OS_VER}.zip"
-          echo "⬇️ Đang tải từ: $URL"
-          
-          wget -q "$URL" -O ncnn-tools.zip || {
-              echo "⚠️ Không tìm thấy bản cho $OS_VER, chuyển sang fallback Ubuntu 2204..."
-              wget -q "https://github.com/Tencent/ncnn/releases/download/20240410/ncnn-20240410-ubuntu-2204.zip" -O ncnn-tools.zip
-          }
-          
-          unzip -q ncnn-tools.zip
-          chmod +x ncnn-20240410-ubuntu-*/bin/onnx2ncnn
-          chmod +x ncnn-20240410-ubuntu-*/bin/ncnnoptimize
-          echo "✅ Tải và giải nén NCNN tools thành công!"
+          pip install onnx onnxsim
+          wget -O 2xParagonSR_Nano_gan.onnx https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp16.onnx
+          python -m onnxsim 2xParagonSR_Nano_gan.onnx 2xParagonSR_Nano_gan_sim.onnx || cp 2xParagonSR_Nano_gan.onnx 2xParagonSR_Nano_gan_sim.onnx
+
+      - name: Download NCNN Tools (20240820)
+        run: |
+          wget -q https://github.com/Tencent/ncnn/releases/download/20240820/ncnn-20240820-ubuntu-2204.zip
+          unzip -q ncnn-20240820-ubuntu-2204.zip
+          chmod +x ncnn-20240820-ubuntu-2204/bin/onnx2ncnn
 
       - name: Convert ONNX to NCNN
         run: |
-          echo "🔹 Bước 1: Convert sang NCNN..."
+          echo "🔹 Đang convert trực tiếp từ ONNX FP16 sang NCNN..."
+          ./ncnn-20240820-ubuntu-2204/bin/onnx2ncnn 2xParagonSR_Nano_gan_sim.onnx 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
           
-          # Tự động tìm thư mục bin chứa tools
-          BIN_DIR=$(find . -maxdepth 2 -type d -name "bin" | grep ncnn | head -1)
-          echo "📂 Sử dụng thư mục tools: $BIN_DIR"
+          # Fix duy nhất cần thiết: ONNX opset 18 dùng DepthToSpace, NCNN cần PixelShuffle
+          sed -i 's/DepthToSpace/PixelShuffle/g' 2xParagonSR_Nano_gan.param
           
-          $BIN_DIR/onnx2ncnn 2xParagonSR_Nano_gan_sim.onnx model.param model.bin
-          
-          # Fix lỗi DepthToSpace -> PixelShuffle (thường gặp ở model SR)
-          sed -i 's/DepthToSpace/PixelShuffle/g' model.param
-          
-          echo " Kích thước file sau khi convert:"
-          ls -lh model.param model.bin
-
-      - name: Optimize NCNN Model (FP16)
-        run: |
-          echo "🔹 Bước 2: Optimize sang FP16 (Giảm dung lượng, tăng tốc GPU mobile)..."
-          
-          BIN_DIR=$(find . -maxdepth 2 -type d -name "bin" | grep ncnn | head -1)
-          
-          # Flag 1: Ép weights sang FP16 packed
-          $BIN_DIR/ncnnoptimize model.param model.bin model_opt.param model_opt.bin 1
-          
-          echo "✅ Hoàn tất! File kết quả cuối cùng:"
-          ls -lh model_opt.param model_opt.bin
+          echo "✅ Hoàn tất! Kết quả:"
+          ls -lh 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
 
       - name: Upload NCNN Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: 2xParagonSR_Nano_gan_ncnn_final
+          name: 2xParagonSR_Nano_gan_ncnn_fp16
           path: |
-            model_opt.param
-            model_opt.bin
+            2xParagonSR_Nano_gan.param
+            2xParagonSR_Nano_gan.bin
           retention-days: 90
