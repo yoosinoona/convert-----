@@ -1,4 +1,4 @@
-name: Convert 1x-SkinContrast-SuperUltraCompact to ONNX
+name: Convert 1x-SkinContrast-SuperUltraCompact to NCNN
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
 jobs:
   convert:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -20,32 +20,40 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-spandrel
-          restore-keys: ${{ runner.os }}-pip-
-
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           pip install --upgrade pip
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install spandrel onnx onnxruntime numpy onnxscript
+          pip install spandrel onnx onnxruntime onnxsim numpy
+
+      - name: Install ncnn build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libprotobuf-dev protobuf-compiler
+
+      - name: Build ncnn tools (onnx2ncnn + ncnn_optimize)
+        run: |
+          git clone --depth 1 https://github.com/Tencent/ncnn.git
+          cd ncnn
+          git submodule update --init
+          mkdir build && cd build
+          cmake \
+            -DNCNN_BUILD_TOOLS=ON \
+            -DNCNN_BUILD_EXAMPLES=OFF \
+            -DNCNN_BUILD_BENCHMARK=OFF \
+            -DNCNN_VULKAN=OFF \
+            ..
+          make -j$(nproc) onnx2ncnn ncnn_optimize
 
       - name: Verify model file
         run: |
           MODEL="models/1xSkinContrast-SuperUltraCompact.pth"
           if [ ! -f "$MODEL" ]; then
-            echo "ERROR: $MODEL not found in repo!"
-            echo "Expected file at: models/1xSkinContrast-SuperUltraCompact.pth"
-            echo "Download from: https://www.mediafire.com/file/hnvatglitgayunh/1xSkinContrast-SuperUltraCompact.pth"
+            echo "ERROR: $MODEL not found!"
             exit 1
           fi
-          echo "File size : $(du -h "$MODEL" | cut -f1)"
-          echo "SHA256    : $(sha256sum "$MODEL" | cut -d' ' -f1)"
-          echo "First bytes:"
-          xxd "$MODEL" | head -1
+          echo "Size: $(du -h "$MODEL" | cut -f1)"
+          echo "SHA256: $(sha256sum "$MODEL" | cut -d' ' -f1)"
 
       - name: Create conversion script
         run: |
@@ -56,16 +64,34 @@ jobs:
           import onnx
           import onnxruntime as ort
           import numpy as np
+          import subprocess
           from spandrel import ModelLoader
 
           MODEL_PATH = "models/1xSkinContrast-SuperUltraCompact.pth"
-          ONNX_PATH = "output/1x-SkinContrast-SuperUltraCompact.onnx"
+          ONNX_RAW = "output/model_raw.onnx"
+          ONNX_SIM = "output/model_sim.onnx"
+          ONNX2NCNN = "ncnn/build/tools/onnx2ncnn"
+          NCNN_OPT = "ncnn/build/tools/ncnn_optimize"
+          NCNN_DIR = "output/ncnn"
+
+          def run_cmd(cmd, desc):
+              print(f"\n  {desc}...")
+              print(f"  $ {cmd}")
+              result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+              if result.stdout.strip():
+                  print(f"  stdout: {result.stdout.strip()[:500]}")
+              if result.returncode != 0:
+                  print(f"  stderr: {result.stderr.strip()[:500]}")
+                  print(f"  WARNING: command returned {result.returncode}")
+              return result.returncode
 
           def main():
               os.makedirs("output", exist_ok=True)
+              os.makedirs(NCNN_DIR, exist_ok=True)
 
+              # ── Step 1: Load model ──
               print("=" * 60)
-              print("Loading model with spandrel...")
+              print("STEP 1: Loading model with spandrel")
               print("=" * 60)
 
               loader = ModelLoader()
@@ -79,13 +105,16 @@ jobs:
               print(f"  Input channels  : {model_descriptor.input_channels}")
               print(f"  Output channels : {model_descriptor.output_channels}")
 
-              dummy_input = torch.randn(1, 3, 64, 64, dtype=torch.float32)
+              # ── Step 2: Export to ONNX ──
+              print("\n" + "=" * 60)
+              print("STEP 2: Exporting to ONNX")
+              print("=" * 60)
 
-              print("\nExporting to ONNX...")
+              dummy_input = torch.randn(1, 3, 64, 64, dtype=torch.float32)
               torch.onnx.export(
                   model,
                   dummy_input,
-                  ONNX_PATH,
+                  ONNX_RAW,
                   export_params=True,
                   opset_version=17,
                   do_constant_folding=True,
@@ -96,41 +125,135 @@ jobs:
                       "output": {0: "batch", 2: "height", 3: "width"},
                   },
               )
-              print(f"  Exported to: {ONNX_PATH}")
+              raw_size = os.path.getsize(ONNX_RAW) / (1024*1024)
+              print(f"  Raw ONNX: {ONNX_RAW} ({raw_size:.2f} MB)")
 
-              print("\nValidating ONNX model...")
-              onnx_model = onnx.load(ONNX_PATH)
-              onnx.checker.check_model(onnx_model)
+              # ── Step 3: Simplify ONNX with onnxsim ──
+              print("\n" + "=" * 60)
+              print("STEP 3: Simplifying ONNX with onnxsim")
+              print("=" * 60)
+
+              from onnxsim import simplify
+              onnx_model = onnx.load(ONNX_RAW)
+              model_sim, ok = simplify(onnx_model)
+              if ok:
+                  onnx.save(model_sim, ONNX_SIM)
+                  sim_size = os.path.getsize(ONNX_SIM) / (1024*1024)
+                  print(f"  Simplified ONNX: {ONNX_SIM} ({sim_size:.2f} MB)")
+              else:
+                  print("  onnxsim failed, using raw ONNX")
+                  import shutil
+                  shutil.copy(ONNX_RAW, ONNX_SIM)
+
+              # ── Step 4: Validate ONNX ──
+              print("\n" + "=" * 60)
+              print("STEP 4: Validating ONNX")
+              print("=" * 60)
+
+              onnx.checker.check_model(onnx.load(ONNX_SIM))
               print("  ONNX checker: PASSED")
 
-              session = ort.InferenceSession(ONNX_PATH, providers=["CPUExecutionProvider"])
+              session = ort.InferenceSession(ONNX_SIM, providers=["CPUExecutionProvider"])
               test_input = np.random.randn(1, 3, 128, 128).astype(np.float32)
               result = session.run(None, {"input": test_input})
-              print(f"  Inference: input {test_input.shape} -> output {result[0].shape}")
+              print(f"  Inference: {test_input.shape} -> {result[0].shape}")
 
-              size_mb = os.path.getsize(ONNX_PATH) / (1024 * 1024)
-              print(f"  File size: {size_mb:.2f} MB")
-              print("\nDONE!")
+              # ── Step 5: Convert ONNX → NCNN ──
+              print("\n" + "=" * 60)
+              print("STEP 5: Converting ONNX to NCNN")
+              print("=" * 60)
+
+              ncnn_param = os.path.join(NCNN_DIR, "model.param")
+              ncnn_bin = os.path.join(NCNN_DIR, "model.bin")
+
+              ret = run_cmd(
+                  f"{ONNX2NCNN} {ONNX_SIM} {ncnn_param} {ncnn_bin}",
+                  "onnx2ncnn"
+              )
+
+              if not os.path.exists(ncnn_param) or not os.path.exists(ncnn_bin):
+                  print("  ERROR: NCNN conversion failed!")
+                  sys.exit(1)
+
+              param_size = os.path.getsize(ncnn_param) / 1024
+              bin_size = os.path.getsize(ncnn_bin) / 1024
+              print(f"  {ncnn_param}: {param_size:.1f} KB")
+              print(f"  {ncnn_bin}: {bin_size:.1f} KB")
+
+              # ── Step 6: Optimize NCNN ──
+              print("\n" + "=" * 60)
+              print("STEP 6: Optimizing NCNN model")
+              print("=" * 60)
+
+              opt_param = os.path.join(NCNN_DIR, "model_opt.param")
+              opt_bin = os.path.join(NCNN_DIR, "model_opt.bin")
+
+              ret = run_cmd(
+                  f"{NCNN_OPT} {ncnn_param} {ncnn_bin} {opt_param} {opt_bin} 65536",
+                  "ncnn_optimize"
+              )
+
+              if os.path.exists(opt_param) and os.path.exists(opt_bin):
+                  opt_param_size = os.path.getsize(opt_param) / 1024
+                  opt_bin_size = os.path.getsize(opt_bin) / 1024
+                  print(f"  {opt_param}: {opt_param_size:.1f} KB")
+                  print(f"  {opt_bin}: {opt_bin_size:.1f} KB")
+                  print("  Optimization: PASSED")
+              else:
+                  print("  Optimization skipped (using unoptimized)")
+
+              # ── Summary ──
+              print("\n" + "=" * 60)
+              print("DONE - Conversion complete!")
+              print("=" * 60)
+              print("\nOutput files:")
+              for f in sorted(os.listdir("output")):
+                  fp = os.path.join("output", f)
+                  if os.path.isfile(fp):
+                      print(f"  {f}: {os.path.getsize(fp)/1024:.1f} KB")
+              for f in sorted(os.listdir(NCNN_DIR)):
+                  fp = os.path.join(NCNN_DIR, f)
+                  if os.path.isfile(fp):
+                      print(f"  ncnn/{f}: {os.path.getsize(fp)/1024:.1f} KB")
 
           if __name__ == "__main__":
               main()
           PYEOF
 
-      - name: Convert to ONNX
+      - name: Convert to NCNN
         run: python convert.py
 
       - name: Package output
         run: |
-          cd output
-          zip -9 1x-SkinContrast-SuperUltraCompact-ONNX.zip *.onnx
-          sha256sum *.onnx > checksums.txt
+          # Create clean output structure
+          mkdir -p release
+          cp output/model.onnx release/ 2>/dev/null || true
+          cp output/model_sim.onnx release/1x-SkinContrast-SuperUltraCompact.onnx
+          cp output/ncnn/model_opt.param release/1x-SkinContrast-SuperUltraCompact.ncnn.param
+          cp output/ncnn/model_opt.bin release/1x-SkinContrast-SuperUltraCompact.ncnn.bin
+
+          cd release
+          sha256sum * > checksums.txt
+          echo "---"
           ls -lh
+          echo "---"
+          cat checksums.txt
+
+          zip -9 ../1x-SkinContrast-SuperUltraCompact-NCNN.zip *
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: 1x-SkinContrast-SuperUltraCompact-ONNX
+          name: 1x-SkinContrast-SuperUltraCompact-NCNN
           path: |
-            output/*.onnx
-            output/checksums.txt
+            release/*
+            1x-SkinContrast-SuperUltraCompact-NCNN.zip
           retention-days: 30
+
+      - name: Upload to Release (if tag exists)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            1x-SkinContrast-SuperUltraCompact-NCNN.zip
+            release/checksums.txt
