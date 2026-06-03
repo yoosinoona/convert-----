@@ -1,4 +1,4 @@
-name: Convert 2xParagonSR_Nano_gan to NCNN (via PNNX)
+name: Convert 2xParagonSR_Nano_gan to NCNN (via PNNX Latest)
 
 on:
   workflow_dispatch:
@@ -12,24 +12,40 @@ jobs:
 
       - name: Download ONNX from Phhofm Release
         run: |
-          echo "⬇️ Đang tải file ONNX từ GitHub Release..."
+          echo "⬇️ Đang tải file ONNX..."
           wget -O 2xParagonSR_Nano_gan.onnx https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp16.onnx
-          echo "✅ Tải thành công!"
-          ls -lh 2xParagonSR_Nano_gan.onnx
+          echo "✅ Tải ONNX thành công!"
 
-      - name: Download PNNX Tool
+      - name: Setup Python & Install onnxsim
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install onnx onnxsim
+
+      - name: Download Latest PNNX via GitHub API
         run: |
-          echo "️ Đang tải PNNX (công cụ convert chính chủ của NCNN)..."
-          wget -q https://github.com/nihui/pnnx/releases/download/20240226/pnnx-20240226-linux.zip
-          unzip -q pnnx-20240226-linux.zip
+          echo "🔍 Đang tìm link PNNX mới nhất từ GitHub API..."
+          # Tự động lấy URL download file linux.zip mới nhất
+          LATEST_URL=$(curl -s https://api.github.com/repos/nihui/pnnx/releases/latest | grep "browser_download_url.*linux.zip" | cut -d '"' -f 4)
+          
+          echo "️ Đang tải PNNX từ: $LATEST_URL"
+          wget -q "$LATEST_URL" -O pnnx-linux.zip
+          unzip -q pnnx-linux.zip
           chmod +x pnnx
-          echo "✅ Tải PNNX thành công!"
+          echo "✅ Tải PNNX thành công! Phiên bản:"
+          ./pnnx --version || echo "(PNNX không có flag version, nhưng file đã sẵn sàng)"
+
+      - name: Simplify ONNX (Optional but recommended)
+        run: |
+          python -m onnxsim 2xParagonSR_Nano_gan.onnx 2xParagonSR_Nano_gan_sim.onnx || {
+            cp 2xParagonSR_Nano_gan.onnx 2xParagonSR_Nano_gan_sim.onnx
+          }
 
       - name: Convert ONNX to NCNN using PNNX
         run: |
           echo "🔹 Đang convert bằng PNNX..."
-          # PNNX cần dummy input shape cho model SR. 1,3,256,256 là chuẩn.
-          ./pnnx 2xParagonSR_Nano_gan.onnx inputshape=[1,3,256,256]
+          # PNNX sẽ tự động tạo ra file .ncnn.param và .ncnn.bin
+          ./pnnx 2xParagonSR_Nano_gan_sim.onnx inputshape=[1,3,256,256]
           
           echo "✅ Convert thành công! File kết quả:"
           ls -lh *.ncnn.param *.ncnn.bin
