@@ -1,4 +1,4 @@
-name: Convert 2xParagonSR_Nano_gan to NCNN (Clean & Fixed)
+name: Convert 2xParagonSR_Nano_gan to NCNN
 
 on:
   workflow_dispatch:
@@ -6,47 +6,47 @@ on:
 jobs:
   convert:
     runs-on: ubuntu-22.04
-    
+
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python & Simplify ONNX
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+
+      - name: Install deps and download ONNX
         run: |
           pip install onnx onnxsim
           wget -O 2xParagonSR_Nano_gan.onnx https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp16.onnx
-          python -m onnxsim 2xParagonSR_Nano_gan.onnx 2xParagonSR_Nano_gan_sim.onnx || cp 2xParagonSR_Nano_gan.onnx 2xParagonSR_Nano_gan_sim.onnx
 
-      - name: Download NCNN Tools & Fix libprotobuf
+      - name: Simplify ONNX
         run: |
-          # Tải tool chính chủ
+          python -m onnxsim 2xParagonSR_Nano_gan.onnx 2xParagonSR_Nano_gan_sim.onnx || \
+            cp 2xParagonSR_Nano_gan.onnx 2xParagonSR_Nano_gan_sim.onnx
+
+      - name: Download NCNN tools
+        run: |
           wget -q https://github.com/Tencent/ncnn/releases/download/20240820/ncnn-20240820-ubuntu-2204.zip
           unzip -q ncnn-20240820-ubuntu-2204.zip
           chmod +x ncnn-20240820-ubuntu-2204/bin/onnx2ncnn
-          
-          # Fix lỗi thiếu libprotobuf.so.23 (Do Tencent build trên env lạ)
-          # Chỉ cần tải đúng gói .deb của Ubuntu 21.10 và cài vào, mất 3 giây!
+
+      - name: Install missing libprotobuf.so.23
+        run: |
           wget -q http://archive.ubuntu.com/ubuntu/pool/main/p/protobuf/libprotobuf23_3.12.4-1ubuntu7_amd64.deb
           sudo dpkg -i libprotobuf23_3.12.4-1ubuntu7_amd64.deb
 
       - name: Convert ONNX to NCNN
         run: |
-          echo "🔹 Đang convert trực tiếp từ ONNX FP16 sang NCNN..."
           ./ncnn-20240820-ubuntu-2204/bin/onnx2ncnn 2xParagonSR_Nano_gan_sim.onnx 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
-          
-          # Bắt buộc phải có vì opset 18 export DepthToSpace thay vì PixelShuffle
           sed -i 's/DepthToSpace/PixelShuffle/g' 2xParagonSR_Nano_gan.param
-          
-          echo "✅ Hoàn tất! Kết quả:"
           ls -lh 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
 
-      - name: Upload NCNN Artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: 2xParagonSR_Nano_gan_ncnn_fp16
+          name: 2xParagonSR_Nano_gan_ncnn
           path: |
             2xParagonSR_Nano_gan.param
             2xParagonSR_Nano_gan.bin
