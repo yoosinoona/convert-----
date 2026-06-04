@@ -1,4 +1,4 @@
-name: Convert 2xParagonSR_Nano_gan (pnnx + ncnn-20260113)
+name: Convert 2xParagonSR_Nano_gan (onnx2ncnn + ncnnoptimize 20260113)
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ jobs:
       - name: Install Python deps
         run: pip install onnx onnxsim
 
-      # ─── Tải ONNX + GIỮ NGUYÊN TÊN GỐC ───
+      # ─── Tải ONNX + giữ nguyên tên gốc ───
       - name: Download ONNX model
         run: |
           wget -q -O net_g_75000_fused_op18_fp32.onnx \
@@ -36,12 +36,10 @@ jobs:
           from onnx import helper
           import os
 
-          # Load bằng đúng tên gốc → tìm được .data
           print("Loading ONNX with external data...")
           model = onnx.load("net_g_75000_fused_op18_fp32.onnx")
-          print("External data merged into memory OK")
+          print("External data merged OK")
 
-          # Thay thế Mish = x * tanh(softplus(x))
           new_nodes = []
           mish_count = 0
           for node in model.graph.node:
@@ -51,9 +49,9 @@ jobs:
                   y  = node.output[0]
                   sp = y + "_softplus"
                   th = y + "_tanh"
-                  new_nodes.append(helper.make_node("Softplus",  [x],     [sp]))
-                  new_nodes.append(helper.make_node("Tanh",      [sp],    [th]))
-                  new_nodes.append(helper.make_node("Mul",       [x, th], [y]))
+                  new_nodes.append(helper.make_node("Softplus", [x],     [sp]))
+                  new_nodes.append(helper.make_node("Tanh",     [sp],    [th]))
+                  new_nodes.append(helper.make_node("Mul",      [x, th], [y]))
               else:
                   new_nodes.append(node)
 
@@ -61,11 +59,9 @@ jobs:
           model.graph.node.extend(new_nodes)
           print(f"Replaced {mish_count} Mish nodes")
 
-          # Lưu thành 1 file duy nhất (không phụ thuộc .data nữa)
           onnx.save(model, "merged.onnx", save_as_external_data=False)
-
           size_mb = os.path.getsize("merged.onnx") / (1024 * 1024)
-          print(f"Saved merged.onnx ({size_mb:.1f} MB, single file)")
+          print(f"Saved merged.onnx ({size_mb:.1f} MB)")
           PYEOF
 
       # ─── Simplify ───
@@ -76,70 +72,114 @@ jobs:
             || cp merged.onnx model_final.onnx
           ls -lh model_final.onnx
 
-      # ─── Tải ncnn-20260113 ───
-      - name: Download ncnn-20260113 tools
+      # ─── Tải CẢ HAI ncnn tools ───
+      - name: Download ncnn tools (20240820 + 20260113)
         run: |
+          # onnx2ncnn từ 20240820 (có onnx2ncnn, convert được Softplus/Tanh/Mul)
+          wget -q "https://github.com/Tencent/ncnn/releases/download/20240820/ncnn-20240820-ubuntu-2204.zip"
+          unzip -q ncnn-20240820-ubuntu-2204.zip
+          chmod +x ncnn-20240820-ubuntu-2204/bin/*
+
+          # ncnnoptimize từ 20260113 (nâng cấp format cho khớp phiên bản Android)
           wget -q "https://github.com/Tencent/ncnn/releases/download/20260113/ncnn-20260113-ubuntu-2204.zip"
           unzip -q ncnn-20260113-ubuntu-2204.zip
           chmod +x ncnn-20260113-ubuntu-2204/bin/*
-          echo "=== Tools available ==="
-          ls ncnn-20260113-ubuntu-2204/bin/
 
-      # ─── Convert bằng pnnx ───
-      - name: Convert ONNX to NCNN with pnnx
+          echo "=== onnx2ncnn (20240820) ==="
+          ls ncnn-20240820-ubuntu-2204/bin/onnx2ncnn
+
+          echo "=== ncnnoptimize (20260113) ==="
+          ls ncnn-20260113-ubuntu-2204/bin/ncnnoptimize
+
+      # ─── Bước 1: Convert ONNX → NCNN bằng onnx2ncnn (20240820) ───
+      - name: Convert ONNX to NCNN with onnx2ncnn
         run: |
-          PNNX=./ncnn-20260113-ubuntu-2204/bin/pnnx
+          ONNX2NCNN=./ncnn-20240820-ubuntu-2204/bin/onnx2ncnn
 
-          if [ ! -f "$PNNX" ]; then
-            echo "ERROR: pnnx not found!"
-            ls ncnn-20260113-ubuntu-2204/bin/
+          $ONNX2NCNN model_final.onnx raw.param raw.bin 2>&1 | tail -5
+
+          # Kiểm tra
+          if [ ! -f "raw.param" ] || [ ! -f "raw.bin" ]; then
+            echo "ERROR: onnx2ncnn failed!"
             exit 1
           fi
 
-          # Chạy pnnx
-          $PNNX model_final.onnx inputshape=[1,3,256,256]
-
-          # Kiểm tra output
-          echo "=== Looking for output files ==="
-          find . -maxdepth 1 -name "*.ncnn.*" -o -name "*.param" -o -name "*.bin" | sort
-
-          if [ ! -f "model_final.ncnn.param" ] || [ ! -f "model_final.ncnn.bin" ]; then
-            echo "ERROR: pnnx output not found!"
+          BIN_SIZE=$(stat -c%s "raw.bin")
+          echo "raw.bin size: $BIN_SIZE bytes"
+          if [ "$BIN_SIZE" -lt 50000 ]; then
+            echo "ERROR: .bin too small!"
             exit 1
           fi
 
-          ls -lh model_final.ncnn.param model_final.ncnn.bin
+          echo "=== onnx2ncnn output OK ==="
+          ls -lh raw.param raw.bin
+
+      # ─── Bước 2: Nâng cấp format bằng ncnnoptimize (20260113) ───
+      - name: Upgrade format with ncnnoptimize 20260113
+        run: |
+          OPT=./ncnn-20260113-ubuntu-2204/bin/ncnnoptimize
+
+          # ncnnoptimize đọc param/bin 20240820 → ghi ra param/bin 20260113 format
+          # Tham số cuối: 0 = không cắt weight nhỏ (giữ nguyên精度)
+          $OPT raw.param raw.bin optimized.param optimized.bin 0 2>&1 | tail -10
+
+          if [ ! -f "optimized.param" ] || [ ! -f "optimized.bin" ]; then
+            echo "ERROR: ncnnoptimize failed!"
+            exit 1
+          fi
+
+          echo "=== ncnnoptimize output OK ==="
+          ls -lh optimized.param optimized.bin
 
       # ─── Post-process ───
       - name: Post-process & validate
         run: |
-          cp model_final.ncnn.param 2xParagonSR_Nano_gan.param
-          cp model_final.ncnn.bin    2xParagonSR_Nano_gan.bin
+          cp optimized.param 2xParagonSR_Nano_gan.param
+          cp optimized.bin    2xParagonSR_Nano_gan.bin
 
-          # DepthToSpace → PixelShuffle nếu cần
+          # DepthToSpace → PixelShuffle nếu có
           if grep -q "DepthToSpace" 2xParagonSR_Nano_gan.param; then
             echo "Replacing DepthToSpace → PixelShuffle..."
             sed -i 's/DepthToSpace/PixelShuffle/g' 2xParagonSR_Nano_gan.param
           fi
 
-          echo "=== Param header ==="
+          echo "=== Param info ==="
+          echo "Header:"
           head -3 2xParagonSR_Nano_gan.param
-
           echo ""
-          echo "=== Input/Output layers ==="
-          grep -E "^(Input|MemoryData)" 2xParagonSR_Nano_gan.param | head -5
-          tail -3 2xParagonSR_Nano_gan.param
-
+          echo "Layer count:"
+          LAYER_COUNT=$(head -1 2xParagonSR_Nano_gan.param | awk '{print $2}')
+          echo "  $LAYER_COUNT layers"
           echo ""
+          echo "Input layer:"
+          grep "^Input" 2xParagonSR_Nano_gan.param | head -1
+          echo ""
+          echo "Output layer:"
+          grep "Convolution" 2xParagonSR_Nano_gan.param | tail -1
+          echo ""
+
+          # Kiểm tra có GroupNorm không (ncnn 20240820 hỗ trợ)
+          if grep -q "GroupNorm" 2xParagonSR_Nano_gan.param; then
+            echo "GroupNorm layers found: $(grep -c 'GroupNorm' 2xParagonSR_Nano_gan.param)"
+          fi
+
+          # Kiểm tra có PixelShuffle không
+          if grep -q "PixelShuffle" 2xParagonSR_Nano_gan.param; then
+            echo "PixelShuffle layer found"
+          fi
+
           BIN_SIZE=$(stat -c%s "2xParagonSR_Nano_gan.bin")
-          echo "BIN size: $BIN_SIZE bytes"
+          echo ""
+          echo "Final BIN size: $BIN_SIZE bytes"
+
           if [ "$BIN_SIZE" -lt 50000 ]; then
             echo "ERROR: .bin too small!"
             exit 1
           fi
 
           echo ""
-          echo "=== SUCCESS ==="
+          echo "=== CONVERSION SUCCESS ==="
+          echo "Param + Bin format: ncnn-20260113"
           ls -lh 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
 
       - name: Upload artifacts
