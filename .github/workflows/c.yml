@@ -8,17 +8,17 @@ permissions:
 
 jobs:
   convert:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Setup Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.10"
 
       - name: Install Python dependencies
         run: |
@@ -26,26 +26,17 @@ jobs:
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install spandrel onnx onnxruntime onnxsim numpy onnxscript
 
-      - name: Build ncnn tools (tag 20230815)
+      - name: Download NCNN tools
         run: |
-          git clone --depth 1 --branch 20230815 https://github.com/Tencent/ncnn.git
-          cd ncnn
-          git submodule update --init
-          mkdir build && cd build
-          cmake \
-            -DNCNN_BUILD_TOOLS=ON \
-            -DNCNN_BUILD_EXAMPLES=OFF \
-            -DNCNN_BUILD_BENCHMARK=OFF \
-            -DNCNN_VULKAN=OFF \
-            ..
-          make -j$(nproc)
+          wget -q https://github.com/Tencent/ncnn/releases/download/20240820/ncnn-20240820-ubuntu-2204.zip
+          unzip -q ncnn-20240820-ubuntu-2204.zip
+          chmod +x ncnn-20240820-ubuntu-2204/bin/onnx2ncnn
+          ls -lh ncnn-20240820-ubuntu-2204/bin/
 
-      - name: Verify tools exist
+      - name: Install libprotobuf
         run: |
-          echo "=== Checking onnx2ncnn ==="
-          find ncnn/build -name "onnx2ncnn" -type f
-          echo "=== Checking ncnnoptimize ==="
-          find ncnn/build -name "ncnnoptimize" -type f
+          wget -q http://archive.ubuntu.com/ubuntu/pool/main/p/protobuf/libprotobuf23_3.12.4-1ubuntu7_amd64.deb
+          sudo dpkg -i libprotobuf23_3.12.4-1ubuntu7_amd64.deb
 
       - name: Verify model file
         run: |
@@ -72,9 +63,8 @@ jobs:
           MODEL_PATH = "models/1xSkinContrast-SuperUltraCompact.pth"
           ONNX_RAW   = "output/model_raw.onnx"
           ONNX_SIM   = "output/model_sim.onnx"
+          NCNN_BIN   = "ncnn-20240820-ubuntu-2204/bin/onnx2ncnn"
           NCNN_DIR   = "output/ncnn"
-          ONNX2NCNN  = "ncnn/build/tools/onnx2ncnn/onnx2ncnn"
-          NCNN_OPT   = "ncnn/build/tools/ncnnoptimize"
 
           os.makedirs("output", exist_ok=True)
           os.makedirs(NCNN_DIR, exist_ok=True)
@@ -147,36 +137,17 @@ jobs:
           print("\n" + "=" * 60)
           print("STEP 5: Convert ONNX to NCNN")
           print("=" * 60)
-
-          if not os.path.isfile(ONNX2NCNN):
-              print(f"  ERROR: {ONNX2NCNN} not found!")
+          if not os.path.isfile(NCNN_BIN):
+              print(f"  ERROR: {NCNN_BIN} not found!")
               sys.exit(1)
-
           param = os.path.join(NCNN_DIR, "model.param")
           bins  = os.path.join(NCNN_DIR, "model.bin")
-          run_cmd(f"{ONNX2NCNN} {ONNX_SIM} {param} {bins}", "onnx2ncnn")
-
+          run_cmd(f"{NCNN_BIN} {ONNX_SIM} {param} {bins}", "onnx2ncnn")
           if not os.path.exists(param) or not os.path.exists(bins):
               print("  ERROR: NCNN files not created!")
               sys.exit(1)
           print(f"  {param}: {os.path.getsize(param)/1024:.1f} KB")
           print(f"  {bins}: {os.path.getsize(bins)/1024:.1f} KB")
-
-          # 6) Optimize
-          print("\n" + "=" * 60)
-          print("STEP 6: Optimize NCNN")
-          print("=" * 60)
-          if os.path.isfile(NCNN_OPT):
-              oparam = os.path.join(NCNN_DIR, "model_opt.param")
-              obins  = os.path.join(NCNN_DIR, "model_opt.bin")
-              run_cmd(f"{NCNN_OPT} {param} {bins} {oparam} {obins} 65536", "optimize")
-              if os.path.exists(oparam) and os.path.exists(obins):
-                  print(f"  {oparam}: {os.path.getsize(oparam)/1024:.1f} KB")
-                  print(f"  {obins}: {os.path.getsize(obins)/1024:.1f} KB")
-              else:
-                  print("  optimize failed, using unoptimized")
-          else:
-              print("  ncnnoptimize not found, skipping")
 
           print("\n" + "=" * 60)
           print("DONE!")
@@ -193,13 +164,8 @@ jobs:
         run: |
           mkdir -p release
           cp output/model_sim.onnx release/1x-SkinContrast-SuperUltraCompact.onnx
-          if [ -f output/ncnn/model_opt.param ]; then
-            cp output/ncnn/model_opt.param release/1x-SkinContrast-SuperUltraCompact.ncnn.param
-            cp output/ncnn/model_opt.bin release/1x-SkinContrast-SuperUltraCompact.ncnn.bin
-          else
-            cp output/ncnn/model.param release/1x-SkinContrast-SuperUltraCompact.ncnn.param
-            cp output/ncnn/model.bin release/1x-SkinContrast-SuperUltraCompact.ncnn.bin
-          fi
+          cp output/ncnn/model.param release/1x-SkinContrast-SuperUltraCompact.ncnn.param
+          cp output/ncnn/model.bin release/1x-SkinContrast-SuperUltraCompact.ncnn.bin
           cd release
           sha256sum * > checksums.txt
           ls -lh
