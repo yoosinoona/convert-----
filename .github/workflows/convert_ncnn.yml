@@ -20,7 +20,7 @@ jobs:
         run: |
           pip install onnx onnxsim
           # ĐỔI TÊN: Bỏ đuôi _fp16 và op18 để lấy file FP32 chuẩn
-          wget -O 2xParagonSR_Nano_gan.onnx https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan.onnx
+          wget -O 2xParagonSR_Nano_gan.onnx https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx
 
       - name: Simplify ONNX
         run: |
