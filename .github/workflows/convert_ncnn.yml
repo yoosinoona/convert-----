@@ -40,17 +40,29 @@ jobs:
 
       - name: Convert ONNX to NCNN
         run: |
-          # B1: Convert từ FP32 ONNX
+          # Check if onnx file exists and has reasonable size (> 10KB)
+          FILE_SIZE=$(stat -c%s "2xParagonSR_Nano_gan_sim.onnx")
+          if [ "$FILE_SIZE" -lt 10000 ]; then
+            echo "ERROR: ONNX file is too small ($FILE_SIZE bytes), download failed!"
+            exit 1
+          fi
+
+          # Convert
           ./ncnn-20240820-ubuntu-2204/bin/onnx2ncnn 2xParagonSR_Nano_gan_sim.onnx 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
           
-          # B2: Dùng ncnnoptimize để dọn dẹp các layer thừa, sửa lỗi Shape/Slice và nén FP16 đúng chuẩn
+          # Check if bin file is valid (> 10KB)
+          BIN_SIZE=$(stat -c%s "2xParagonSR_Nano_gan.bin")
+          if [ "$BIN_SIZE" -lt 10000 ]; then
+            echo "ERROR: NCNN .bin file is too small ($BIN_SIZE bytes), conversion failed!"
+            exit 1
+          fi
+
+          # Optimize
           ./ncnn-20240820-ubuntu-2204/bin/ncnnoptimize 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin 2xParagonSR_Nano_gan_opt.param 2xParagonSR_Nano_gan_opt.bin 65536
           
-          # Đổi tên về tên gốc cho dễ dùng
           mv 2xParagonSR_Nano_gan_opt.param 2xParagonSR_Nano_gan.param
           mv 2xParagonSR_Nano_gan_opt.bin 2xParagonSR_Nano_gan.bin
           
-          # Sửa DepthToSpace thành PixelShuffle (nếu cần)
           sed -i 's/DepthToSpace/PixelShuffle/g' 2xParagonSR_Nano_gan.param
           
           ls -lh 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
