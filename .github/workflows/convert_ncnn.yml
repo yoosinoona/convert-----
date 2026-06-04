@@ -1,4 +1,4 @@
-name: Convert 2xParagonSR_Nano_gan to NCNN
+name: Convert 2xParagonSR_Nano_gan to NCNN (FP32 Source)
 
 on:
   workflow_dispatch:
@@ -16,10 +16,11 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install deps and download ONNX
+      - name: Install deps and download ONNX (FP32!)
         run: |
           pip install onnx onnxsim
-          wget -O 2xParagonSR_Nano_gan.onnx https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp16.onnx
+          # ĐỔI TÊN: Bỏ đuôi _fp16 và op18 để lấy file FP32 chuẩn
+          wget -O 2xParagonSR_Nano_gan.onnx https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan.onnx
 
       - name: Simplify ONNX
         run: |
@@ -30,7 +31,7 @@ jobs:
         run: |
           wget -q https://github.com/Tencent/ncnn/releases/download/20240820/ncnn-20240820-ubuntu-2204.zip
           unzip -q ncnn-20240820-ubuntu-2204.zip
-          chmod +x ncnn-20240820-ubuntu-2204/bin/onnx2ncnn
+          chmod +x ncnn-20240820-ubuntu-2204/bin/onnx2ncnn ncnn-20240820-ubuntu-2204/bin/ncnnoptimize
 
       - name: Install missing libprotobuf.so.23
         run: |
@@ -39,14 +40,25 @@ jobs:
 
       - name: Convert ONNX to NCNN
         run: |
+          # B1: Convert từ FP32 ONNX
           ./ncnn-20240820-ubuntu-2204/bin/onnx2ncnn 2xParagonSR_Nano_gan_sim.onnx 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
+          
+          # B2: Dùng ncnnoptimize để dọn dẹp các layer thừa, sửa lỗi Shape/Slice và nén FP16 đúng chuẩn
+          ./ncnn-20240820-ubuntu-2204/bin/ncnnoptimize 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin 2xParagonSR_Nano_gan_opt.param 2xParagonSR_Nano_gan_opt.bin 65536
+          
+          # Đổi tên về tên gốc cho dễ dùng
+          mv 2xParagonSR_Nano_gan_opt.param 2xParagonSR_Nano_gan.param
+          mv 2xParagonSR_Nano_gan_opt.bin 2xParagonSR_Nano_gan.bin
+          
+          # Sửa DepthToSpace thành PixelShuffle (nếu cần)
           sed -i 's/DepthToSpace/PixelShuffle/g' 2xParagonSR_Nano_gan.param
+          
           ls -lh 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: 2xParagonSR_Nano_gan_ncnn
+          name: 2xParagonSR_Nano_gan_ncnn_fp32source
           path: |
             2xParagonSR_Nano_gan.param
             2xParagonSR_Nano_gan.bin
