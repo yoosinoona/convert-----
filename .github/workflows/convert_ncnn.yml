@@ -1,4 +1,4 @@
-name: Convert 2xParagonSR_Nano_gan (Fix Mish & Shape)
+name: Convert 2xParagonSR_Nano_gan (Fix External Data & Mish)
 
 on:
   workflow_dispatch:
@@ -17,19 +17,24 @@ jobs:
           python-version: '3.10'
 
       - name: Install deps
-        run: |
-          pip install onnx onnxsim
+        run: pip install onnx onnxsim
 
       - name: Download and Preprocess ONNX
         run: |
-          wget -O model.onnx https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx
+          # Tải cả 2 file cấu trúc và trọng số
+          wget -O net_g_75000_fused_op18_fp32.onnx https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx
+          wget -O net_g_75000_fused_op18_fp32.onnx.data https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx.data
+          ls -lh net_g_75000_fused_op18_fp32.onnx net_g_75000_fused_op18_fp32.onnx.data
           
-          # 1. Thay thế Mish bằng Softplus + Tanh + Mul (Công thức toán học của Mish)
+          # 1. Load model (lúc này Python sẽ đọc được trọng số từ file .data)
+          # 2. Thay thế Mish bằng Softplus + Tanh + Mul
+          # 3. Lưu thành 1 file duy nhất (temp.onnx), không còn phụ thuộc .data nữa
           python -c "
           import onnx
           from onnx import helper
           
-          model = onnx.load('model.onnx')
+          print('Loading ONNX with external data...')
+          model = onnx.load('net_g_75000_fused_op18_fp32.onnx')
           input_name = model.graph.input[0].name
           print(f'Found input name: {input_name}')
           
@@ -50,14 +55,17 @@ jobs:
           del model.graph.node[:]
           model.graph.node.extend(new_nodes)
           print(f'Replaced {mish_cnt} Mish nodes.')
+          
+          print('Saving combined ONNX...')
           onnx.save(model, 'temp.onnx')
+          print('Saved temp.onnx successfully.')
           "
           
-          # 2. Simplify và ép kích thước Input để gộp các node Shape
+          # Simplify và ép kích thước Input
           python -m onnxsim temp.onnx model_sim.onnx --input-shape "input:1,3,256,256" || cp temp.onnx model_sim.onnx
           ls -lh model_sim.onnx
 
-      - name: Download NCNN tools (Pre-built)
+      - name: Download NCNN tools
         run: |
           wget -q https://github.com/Tencent/ncnn/releases/download/20240820/ncnn-20240820-ubuntu-2204.zip
           unzip -q ncnn-20240820-ubuntu-2204.zip
@@ -78,6 +86,7 @@ jobs:
             exit 1
           fi
 
+          # Dùng ncnnoptimize để dọn dẹp và chuyển đổi FP32 weights sang lưu trữ FP16
           ./ncnn-20240820-ubuntu-2204/bin/ncnnoptimize 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin 2xParagonSR_Nano_gan_opt.param 2xParagonSR_Nano_gan_opt.bin 65536
           
           mv 2xParagonSR_Nano_gan_opt.param 2xParagonSR_Nano_gan.param
