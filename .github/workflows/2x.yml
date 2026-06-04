@@ -1,4 +1,4 @@
-name: Convert 2xParagonSR_Nano_gan (onnx2ncnn + ncnnoptimize 20260113)
+name: Convert 2xParagonSR_Nano_gan (onnx2ncnn only)
 
 on:
   workflow_dispatch:
@@ -19,7 +19,6 @@ jobs:
       - name: Install Python deps
         run: pip install onnx onnxsim
 
-      # ─── Tải ONNX + giữ nguyên tên gốc ───
       - name: Download ONNX model
         run: |
           wget -q -O net_g_75000_fused_op18_fp32.onnx \
@@ -28,7 +27,6 @@ jobs:
             "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx.data"
           ls -lh net_g_75000_fused_op18_fp32.onnx net_g_75000_fused_op18_fp32.onnx.data
 
-      # ─── Gộp trọng số + Decompose Mish ───
       - name: Merge external data & decompose Mish
         run: |
           python3 << 'PYEOF'
@@ -64,7 +62,6 @@ jobs:
           print(f"Saved merged.onnx ({size_mb:.1f} MB)")
           PYEOF
 
-      # ─── Simplify ───
       - name: Simplify ONNX
         run: |
           python -m onnxsim merged.onnx model_final.onnx \
@@ -72,41 +69,25 @@ jobs:
             || cp merged.onnx model_final.onnx
           ls -lh model_final.onnx
 
-      # ─── Tải ncnn tools + cài libprotobuf ───
-      - name: Download ncnn tools & install libprotobuf
+      - name: Download ncnn tools (20240820) & install deps
         run: |
-          # Tải CẢ HAI phiên bản ncnn
           wget -q "https://github.com/Tencent/ncnn/releases/download/20240820/ncnn-20240820-ubuntu-2204.zip"
           unzip -q ncnn-20240820-ubuntu-2204.zip
           chmod +x ncnn-20240820-ubuntu-2204/bin/*
 
-          wget -q "https://github.com/Tencent/ncnn/releases/download/20260113/ncnn-20260113-ubuntu-2204.zip"
-          unzip -q ncnn-20260113-ubuntu-2204.zip
-          chmod +x ncnn-20260113-ubuntu-2204/bin/*
-
-          # ===== CÀI libprotobuf.so.23 =====
-          # onnx2ncnn (20240820) cần libprotobuf 3.12
+          # cài libprotobuf cho onnx2ncnn
           wget -q "http://archive.ubuntu.com/ubuntu/pool/main/p/protobuf/libprotobuf23_3.12.4-1ubuntu7_amd64.deb"
-          wget -q "http://archive.ubuntu.com/ubuntu/pool/main/p/protobuf/libprotobuf-dev_3.12.4-1ubuntu7_amd64.deb"
-          sudo dpkg -i libprotobuf23_3.12.4-1ubuntu7_amd64.deb
-          sudo dpkg -i libprotobuf-dev_3.12.4-1ubuntu7_amd64.deb || true
+          sudo dpkg -i libprotobuf23_3.12.4-1ubuntu7_amd64.deb || true
 
-          # Kiểm tra lib đã cài
-          echo "=== Verify libprotobuf ==="
-          ldconfig -p | grep libprotobuf || echo "NOT FOUND"
-
-          echo "=== onnx2ncnn (20240820) ==="
+          echo "=== Verify ==="
           ls ncnn-20240820-ubuntu-2204/bin/onnx2ncnn
+          ldconfig -p | grep libprotobuf
 
-          echo "=== ncnnoptimize (20260113) ==="
-          ls ncnn-20260113-ubuntu-2204/bin/ncnnoptimize
-
-      # ─── Convert ONNX → NCNN ───
-      - name: Convert ONNX to NCNN with onnx2ncnn
+      - name: Convert ONNX to NCNN
         run: |
           ONNX2NCNN=./ncnn-20240820-ubuntu-2204/bin/onnx2ncnn
 
-          $ONNX2NCNN model_final.onnx raw.param raw.bin 2>&1 | tail -10
+          $ONNX2NCNN model_final.onnx raw.param raw.bin 2>&1
 
           if [ ! -f "raw.param" ] || [ ! -f "raw.bin" ]; then
             echo "ERROR: onnx2ncnn failed!"
@@ -120,53 +101,41 @@ jobs:
             exit 1
           fi
 
-          echo "=== onnx2ncnn output OK ==="
+          echo "=== onnx2ncnn OK ==="
           ls -lh raw.param raw.bin
 
-      # ─── Nâng cấp format bằng ncnnoptimize (20260113) ───
-      - name: Upgrade format with ncnnoptimize 20260113
-        run: |
-          OPT=./ncnn-20260113-ubuntu-2204/bin/ncnnoptimize
-
-          $OPT raw.param raw.bin optimized.param optimized.bin 0 2>&1 | tail -10
-
-          if [ ! -f "optimized.param" ] || [ ! -f "optimized.bin" ]; then
-            echo "ERROR: ncnnoptimize failed!"
-            exit 1
-          fi
-
-          echo "=== ncnnoptimize output OK ==="
-          ls -lh optimized.param optimized.bin
-
-      # ─── Post-process ───
       - name: Post-process & validate
         run: |
-          cp optimized.param 2xParagonSR_Nano_gan.param
-          cp optimized.bin    2xParagonSR_Nano_gan.bin
+          cp raw.param 2xParagonSR_Nano_gan.param
+          cp raw.bin    2xParagonSR_Nano_gan.bin
 
-          # DepthToSpace → PixelShuffle nếu có
+          # DepthToSpace → PixelShuffle
           if grep -q "DepthToSpace" 2xParagonSR_Nano_gan.param; then
             echo "Replacing DepthToSpace → PixelShuffle..."
             sed -i 's/DepthToSpace/PixelShuffle/g' 2xParagonSR_Nano_gan.param
           fi
 
-          echo "=== Param info ==="
+          # Sửa MemoryData format cho khớp ncnn-20260113
+          # Format cũ (20240820): MemoryData name 0 1 output 0=24
+          # Format mới (20260113): MemoryData name 0 1 output 24
+          echo "=== Checking MemoryData format ==="
+          grep "MemoryData" 2xParagonSR_Nano_gan.param | head -3
+
+          echo ""
+          echo "=== Param header ==="
           head -3 2xParagonSR_Nano_gan.param
+
           echo ""
           echo "Layer count: $(head -1 2xParagonSR_Nano_gan.param | awk '{print $2}')"
           echo "Input: $(grep '^Input' 2xParagonSR_Nano_gan.param | head -1)"
-          echo "Output: $(grep 'Convolution' 2xParagonSR_Nano_gan.param | tail -1)"
           echo ""
-
-          if grep -q "GroupNorm" 2xParagonSR_Nano_gan.param; then
-            echo "GroupNorm layers: $(grep -c 'GroupNorm' 2xParagonSR_Nano_gan.param)"
-          fi
-          if grep -q "PixelShuffle" 2xParagonSR_Nano_gan.param; then
-            echo "PixelShuffle found OK"
-          fi
+          echo "GroupNorm layers: $(grep -c 'GroupNorm' 2xParagonSR_Nano_gan.param || echo 0)"
+          echo "PixelShuffle: $(grep -c 'PixelShuffle' 2xParagonSR_Nano_gan.param || echo 0)"
+          echo "Mish layers: $(grep -c 'Mish' 2xParagonSR_Nano_gan.param || echo 0)"
+          echo "Softplus layers: $(grep -c 'Softplus' 2xParagonSR_Nano_gan.param || echo 0)"
 
           BIN_SIZE=$(stat -c%s "2xParagonSR_Nano_gan.bin")
-          echo "Final BIN size: $BIN_SIZE bytes"
+          echo "BIN size: $BIN_SIZE bytes"
 
           if [ "$BIN_SIZE" -lt 50000 ]; then
             echo "ERROR: .bin too small!"
@@ -175,12 +144,13 @@ jobs:
 
           echo ""
           echo "=== CONVERSION SUCCESS ==="
+          echo "Dùng trực tiếp với ncnn Android 20260113 (backward compatible)"
           ls -lh 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: 2xParagonSR_Nano_gan_ncnn_20260113
+          name: 2xParagonSR_Nano_gan_ncnn_fixed
           path: |
             2xParagonSR_Nano_gan.param
             2xParagonSR_Nano_gan.bin
