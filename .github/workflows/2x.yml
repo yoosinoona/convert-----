@@ -1,0 +1,160 @@
+name: Convert 2xParagonSR_Nano_gan (pnnx + ncnn-20260113)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  convert:
+    runs-on: ubuntu-22.04
+
+    steps:
+      # ─── Bước 1: Checkout ───
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ─── Bước 2: Python ───
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Python deps
+        run: pip install onnx onnxsim
+
+      # ─── Bước 3: Tải ONNX + trọng số ngoài ───
+      - name: Download ONNX model
+        run: |
+          wget -q -O model.onnx \
+            "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx"
+          wget -q -O model.onnx.data \
+            "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx.data"
+          ls -lh model.onnx model.onnx.data
+
+      # ─── Bước 4: Gộp trọng số + Decompose Mish ───
+      - name: Merge external data & decompose Mish
+        run: |
+          python3 << 'EOF'
+          import onnx
+          from onnx import helper, TensorProto
+
+          print("Loading ONNX with external data...")
+          model = onnx.load("model.onnx")
+
+          # Thay thế Mish = x * tanh(softplus(x))
+          new_nodes = []
+          mish_count = 0
+          for node in model.graph.node:
+              if node.op_type == "Mish":
+                  mish_count += 1
+                  x  = node.input[0]
+                  y  = node.output[0]
+                  sp = y + "_softplus"
+                  th = y + "_tanh"
+                  new_nodes.append(helper.make_node("Softplus",  [x],  [sp]))
+                  new_nodes.append(helper.make_node("Tanh",      [sp], [th]))
+                  new_nodes.append(helper.make_node("Mul",       [x, th], [y]))
+              else:
+                  new_nodes.append(node)
+
+          del model.graph.node[:]
+          model.graph.node.extend(new_nodes)
+          print(f"Replaced {mish_count} Mish nodes")
+
+          # Lưu thành 1 file duy nhất (không còn phụ thuộc .data)
+          onnx.save(model, "merged.onnx", save_as_external_data=False)
+
+          import os
+          size_mb = os.path.getsize("merged.onnx") / (1024*1024)
+          print(f"Saved merged.onnx ({size_mb:.1f} MB)")
+          EOF
+
+      # ─── Bước 5: Simplify ONNX ───
+      - name: Simplify ONNX
+        run: |
+          python -m onnxsim merged.onnx model_final.onnx \
+            --input-shape "input:1,3,256,256" 2>&1 \
+            || cp merged.onnx model_final.onnx
+          ls -lh model_final.onnx
+
+      # ─── Bước 6: Tải ncnn-20260113 ───
+      - name: Download ncnn-20260113 tools
+        run: |
+          wget -q "https://github.com/Tencent/ncnn/releases/download/20260113/ncnn-20260113-ubuntu-2204.zip"
+          unzip -q ncnn-20260113-ubuntu-2204.zip
+          chmod +x ncnn-20260113-ubuntu-2204/bin/*
+
+          echo "=== Tools available ==="
+          ls ncnn-20260113-ubuntu-2204/bin/
+
+      # ─── Bước 7: Convert bằng pnnx ───
+      - name: Convert ONNX → NCNN with pnnx
+        run: |
+          PNNX=./ncnn-20260113-ubuntu-2204/bin/pnnx
+
+          # Kiểm tra pnnx tồn tại
+          if [ ! -f "$PNNX" ]; then
+            echo "ERROR: pnnx not found!"
+            ls ncnn-20260113-ubuntu-2204/bin/
+            exit 1
+          fi
+
+          # Chạy pnnx từ thư mục gốc
+          # pnnx sẽ output: model_final.ncnn.param, model_final.ncnn.bin
+          $PNNX model_final.onnx inputshape=[1,3,256,256]
+
+          # Kiểm tra output tồn tại
+          if [ ! -f "model_final.ncnn.param" ] || [ ! -f "model_final.ncnn.bin" ]; then
+            echo "ERROR: pnnx output not found!"
+            echo "Looking for ncnn output files..."
+            find . -name "*.ncnn.*" -o -name "*.param" -o -name "*.bin" | head -20
+            exit 1
+          fi
+
+          ls -lh model_final.ncnn.param model_final.ncnn.bin
+
+      # ─── Bước 8: Post-process ───
+      - name: Post-process param file
+        run: |
+          # Copy sang tên cuối cùng
+          cp model_final.ncnn.param 2xParagonSR_Nano_gan.param
+          cp model_final.ncnn.bin    2xParagonSR_Nano_gan.bin
+
+          # Sửa DepthToSpace → PixelShuffle nếu có
+          if grep -q "DepthToSpace" 2xParagonSR_Nano_gan.param; then
+            echo "Found DepthToSpace, replacing with PixelShuffle..."
+            sed -i 's/DepthToSpace/PixelShuffle/g' 2xParagonSR_Nano_gan.param
+          else
+            echo "No DepthToSpace found (pnnx may already use PixelShuffle)"
+          fi
+
+          # Hiển thị thông tin model
+          echo "=== Param header ==="
+          head -2 2xParagonSR_Nano_gan.param
+
+          echo "=== Blob names (input/output) ==="
+          # Kiểm tra tên blob input/output
+          grep -m1 "Input" 2xParagonSR_Nano_gan.param || true
+          grep -m1 "output" 2xParagonSR_Nano_gan.param || true
+
+          # Kiểm tra bin size
+          BIN_SIZE=$(stat -c%s "2xParagonSR_Nano_gan.bin")
+          echo "BIN size: $BIN_SIZE bytes"
+
+          if [ "$BIN_SIZE" -lt 50000 ]; then
+            echo "ERROR: .bin too small ($BIN_SIZE bytes)!"
+            exit 1
+          fi
+
+          echo ""
+          echo "=== SUCCESS ==="
+          ls -lh 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
+
+      # ─── Bước 9: Upload ───
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: 2xParagonSR_Nano_gan_ncnn_20260113
+          path: |
+            2xParagonSR_Nano_gan.param
+            2xParagonSR_Nano_gan.bin
+          retention-days: 90
