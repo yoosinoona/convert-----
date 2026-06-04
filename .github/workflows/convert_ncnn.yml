@@ -1,4 +1,4 @@
-name: Convert 2xParagonSR_Nano_gan (Build Latest NCNN)
+name: Convert 2xParagonSR_Nano_gan (Fix Mish & Shape)
 
 on:
   workflow_dispatch:
@@ -19,26 +19,12 @@ jobs:
       - name: Install deps
         run: |
           pip install onnx onnxsim
-          sudo apt-get update
-          sudo apt-get install -y cmake g++ libprotobuf-dev protobuf-compiler
-
-      - name: Build latest onnx2ncnn from source
-        run: |
-          git clone https://github.com/Tencent/ncnn.git
-          cd ncnn
-          mkdir build && cd build
-          cmake .. -DNCNN_BUILD_TOOLS=ON
-          make -j$(nproc) onnx2ncnn ncnnoptimize
-          cp onnx2ncnn /usr/local/bin/
-          cp ncnnoptimize /usr/local/bin/
-          cd ../..
-          rm -rf ncnn
 
       - name: Download and Preprocess ONNX
         run: |
           wget -O model.onnx https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx
           
-          # Dùng Python để thay thế Mish bằng Softplus+Tanh+Mul trước khi convert
+          # 1. Thay thế Mish bằng Softplus + Tanh + Mul (Công thức toán học của Mish)
           python -c "
           import onnx
           from onnx import helper
@@ -47,7 +33,6 @@ jobs:
           input_name = model.graph.input[0].name
           print(f'Found input name: {input_name}')
           
-          # Replace Mish nodes
           new_nodes = []
           mish_cnt = 0
           for node in model.graph.node:
@@ -66,24 +51,25 @@ jobs:
           model.graph.node.extend(new_nodes)
           print(f'Replaced {mish_cnt} Mish nodes.')
           onnx.save(model, 'temp.onnx')
-          
-          # Simplify with forced input shape to fold Shape nodes
-          import subprocess
-          cmd = f'python -m onnxsim temp.onnx model_sim.onnx --input-shape {input_name}:1,3,256,256'
-          print(f'Running: {cmd}')
-          subprocess.run(cmd, shell=True, check=False)
           "
           
-          # Fallback if onnxsim fails
-          if [ ! -f "model_sim.onnx" ]; then
-            echo "onnxsim failed, using non-simplified model"
-            cp temp.onnx model_sim.onnx
-          fi
+          # 2. Simplify và ép kích thước Input để gộp các node Shape
+          python -m onnxsim temp.onnx model_sim.onnx --input-shape "input:1,3,256,256" || cp temp.onnx model_sim.onnx
           ls -lh model_sim.onnx
+
+      - name: Download NCNN tools (Pre-built)
+        run: |
+          wget -q https://github.com/Tencent/ncnn/releases/download/20240820/ncnn-20240820-ubuntu-2204.zip
+          unzip -q ncnn-20240820-ubuntu-2204.zip
+          chmod +x ncnn-20240820-ubuntu-2204/bin/onnx2ncnn ncnn-20240820-ubuntu-2204/bin/ncnnoptimize
+          
+          # Install missing libprotobuf
+          wget -q http://archive.ubuntu.com/ubuntu/pool/main/p/protobuf/libprotobuf23_3.12.4-1ubuntu7_amd64.deb
+          sudo dpkg -i libprotobuf23_3.12.4-1ubuntu7_amd64.deb
 
       - name: Convert ONNX to NCNN
         run: |
-          onnx2ncnn model_sim.onnx 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
+          ./ncnn-20240820-ubuntu-2204/bin/onnx2ncnn model_sim.onnx 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
           
           # Check if bin file is valid (> 50KB)
           BIN_SIZE=$(stat -c%s "2xParagonSR_Nano_gan.bin")
@@ -92,7 +78,7 @@ jobs:
             exit 1
           fi
 
-          ncnnoptimize 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin 2xParagonSR_Nano_gan_opt.param 2xParagonSR_Nano_gan_opt.bin 65536
+          ./ncnn-20240820-ubuntu-2204/bin/ncnnoptimize 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin 2xParagonSR_Nano_gan_opt.param 2xParagonSR_Nano_gan_opt.bin 65536
           
           mv 2xParagonSR_Nano_gan_opt.param 2xParagonSR_Nano_gan.param
           mv 2xParagonSR_Nano_gan_opt.bin 2xParagonSR_Nano_gan.bin
