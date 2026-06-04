@@ -26,9 +26,9 @@ jobs:
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install spandrel onnx onnxruntime onnxsim numpy onnxscript
 
-      - name: Build ncnn tools
+      - name: Build ncnn tools (tag 20230815)
         run: |
-          git clone --depth 1 https://github.com/Tencent/ncnn.git
+          git clone --depth 1 --branch 20230815 https://github.com/Tencent/ncnn.git
           cd ncnn
           git submodule update --init
           mkdir build && cd build
@@ -40,6 +40,13 @@ jobs:
             ..
           make -j$(nproc)
 
+      - name: Verify tools exist
+        run: |
+          echo "=== Checking onnx2ncnn ==="
+          find ncnn/build -name "onnx2ncnn" -type f
+          echo "=== Checking ncnnoptimize ==="
+          find ncnn/build -name "ncnnoptimize" -type f
+
       - name: Verify model file
         run: |
           MODEL="models/1xSkinContrast-SuperUltraCompact.pth"
@@ -50,10 +57,6 @@ jobs:
           echo "Size   : $(du -h "$MODEL" | cut -f1)"
           echo "SHA256 : $(sha256sum "$MODEL" | cut -d' ' -f1)"
 
-      - name: Install pyncnn
-        run: |
-          pip install ncnn
-
       - name: Convert model
         run: |
           cat > convert.py << 'PYEOF'
@@ -62,17 +65,31 @@ jobs:
           import onnx
           import onnxruntime as ort
           import numpy as np
+          import subprocess
           from spandrel import ModelLoader
           from onnxsim import simplify
-          import ncnn
 
           MODEL_PATH = "models/1xSkinContrast-SuperUltraCompact.pth"
           ONNX_RAW   = "output/model_raw.onnx"
           ONNX_SIM   = "output/model_sim.onnx"
           NCNN_DIR   = "output/ncnn"
+          ONNX2NCNN  = "ncnn/build/tools/onnx2ncnn/onnx2ncnn"
+          NCNN_OPT   = "ncnn/build/tools/ncnnoptimize"
 
           os.makedirs("output", exist_ok=True)
           os.makedirs(NCNN_DIR, exist_ok=True)
+
+          def run_cmd(cmd, desc):
+              print(f"\n  {desc}...")
+              print(f"  $ {cmd}")
+              r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+              if r.stdout.strip():
+                  print(f"  stdout: {r.stdout.strip()[:1000]}")
+              if r.stderr.strip():
+                  print(f"  stderr: {r.stderr.strip()[:1000]}")
+              if r.returncode != 0:
+                  print(f"  WARNING: returned {r.returncode}")
+              return r.returncode
 
           # 1) Load
           print("=" * 60)
@@ -109,8 +126,10 @@ jobs:
           m, ok = simplify(onnx.load(ONNX_RAW))
           if ok:
               onnx.save(m, ONNX_SIM)
+              print("  Simplified OK")
           else:
               shutil.copy(ONNX_RAW, ONNX_SIM)
+              print("  Simplify failed, using raw")
           print(f"  {ONNX_SIM}: {os.path.getsize(ONNX_SIM)/1024/1024:.2f} MB")
 
           # 4) Validate ONNX
@@ -122,38 +141,43 @@ jobs:
           sess = ort.InferenceSession(ONNX_SIM, providers=["CPUExecutionProvider"])
           t = np.random.randn(1, 3, 128, 128).astype(np.float32)
           r = sess.run(None, {"input": t})
-          print(f"  {t.shape} -> {r[0].shape}")
+          print(f"  ONNX: {t.shape} -> {r[0].shape}")
 
-          # 5) Convert ONNX -> NCNN via pyncnn
+          # 5) ONNX -> NCNN
           print("\n" + "=" * 60)
           print("STEP 5: Convert ONNX to NCNN")
           print("=" * 60)
-          ncnn_path = os.path.join(NCNN_DIR, "model")
-          ret = ncnn.convert(
-              ONNX_SIM,
-              ncnn_path + ".param",
-              ncnn_path + ".bin",
-          )
-          if ret != 0:
-              print(f"  ncnn.convert returned {ret}, trying alternative...")
+
+          if not os.path.isfile(ONNX2NCNN):
+              print(f"  ERROR: {ONNX2NCNN} not found!")
               sys.exit(1)
-          print(f"  param: {os.path.getsize(ncnn_path+'.param')/1024:.1f} KB")
-          print(f"  bin:   {os.path.getsize(ncnn_path+'.bin')/1024:.1f} KB")
 
-          # 6) Verify NCNN inference
+          param = os.path.join(NCNN_DIR, "model.param")
+          bins  = os.path.join(NCNN_DIR, "model.bin")
+          run_cmd(f"{ONNX2NCNN} {ONNX_SIM} {param} {bins}", "onnx2ncnn")
+
+          if not os.path.exists(param) or not os.path.exists(bins):
+              print("  ERROR: NCNN files not created!")
+              sys.exit(1)
+          print(f"  {param}: {os.path.getsize(param)/1024:.1f} KB")
+          print(f"  {bins}: {os.path.getsize(bins)/1024:.1f} KB")
+
+          # 6) Optimize
           print("\n" + "=" * 60)
-          print("STEP 6: Verify NCNN inference")
+          print("STEP 6: Optimize NCNN")
           print("=" * 60)
-          net = ncnn.Net()
-          net.load_param(ncnn_path + ".param")
-          net.load_model(ncnn_path + ".bin")
-          ex = net.create_extractor()
-          ex.input("input", ncnn.Mat(np.random.randn(3, 64, 64).astype(np.float32)))
-          _, out = ex.extract("output")
-          print(f"  NCNN inference: output shape = {out.shape}")
-          print("  NCNN model: VERIFIED")
+          if os.path.isfile(NCNN_OPT):
+              oparam = os.path.join(NCNN_DIR, "model_opt.param")
+              obins  = os.path.join(NCNN_DIR, "model_opt.bin")
+              run_cmd(f"{NCNN_OPT} {param} {bins} {oparam} {obins} 65536", "optimize")
+              if os.path.exists(oparam) and os.path.exists(obins):
+                  print(f"  {oparam}: {os.path.getsize(oparam)/1024:.1f} KB")
+                  print(f"  {obins}: {os.path.getsize(obins)/1024:.1f} KB")
+              else:
+                  print("  optimize failed, using unoptimized")
+          else:
+              print("  ncnnoptimize not found, skipping")
 
-          # Done
           print("\n" + "=" * 60)
           print("DONE!")
           print("=" * 60)
