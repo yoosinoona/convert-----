@@ -1,4 +1,4 @@
-name: Convert 2xParagonSR_Nano_gan (Fix External Data & Mish)
+name: Convert 2xParagonSR_Nano_gan (Fix External Data & Mish) v2
 
 on:
   workflow_dispatch:
@@ -56,8 +56,8 @@ jobs:
           model.graph.node.extend(new_nodes)
           print(f'Replaced {mish_cnt} Mish nodes.')
           
-          print('Saving combined ONNX...')
-          onnx.save(model, 'temp.onnx')
+          print('Saving combined ONNX (forcing single file)...')
+          onnx.save(model, 'temp.onnx', save_as_external_data=False)
           print('Saved temp.onnx successfully.')
           "
           
