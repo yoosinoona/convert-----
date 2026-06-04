@@ -85,16 +85,12 @@ jobs:
             echo "ERROR: NCNN .bin file is too small ($BIN_SIZE bytes), conversion failed!"
             exit 1
           fi
-
-          # Dùng ncnnoptimize để dọn dẹp và chuyển đổi FP32 weights sang lưu trữ FP16
-          ./ncnn-20240820-ubuntu-2204/bin/ncnnoptimize 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin 2xParagonSR_Nano_gan_opt.param 2xParagonSR_Nano_gan_opt.bin 65536
           
-          mv 2xParagonSR_Nano_gan_opt.param 2xParagonSR_Nano_gan.param
-          mv 2xParagonSR_Nano_gan_opt.bin 2xParagonSR_Nano_gan.bin
-          
-          sed -i 's/DepthToSpace/PixelShuffle/g' 2xParagonSR_Nano_gan.param
-          
+          echo "Conversion successful! File sizes:"
           ls -lh 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
+          
+          # Sửa DepthToSpace thành PixelShuffle
+          sed -i 's/DepthToSpace/PixelShuffle/g' 2xParagonSR_Nano_gan.param
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
