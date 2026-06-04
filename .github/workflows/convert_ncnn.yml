@@ -1,4 +1,4 @@
-name: Convert 2xParagonSR_Nano_gan to NCNN (FP32 Source)
+name: Convert 2xParagonSR_Nano_gan to NCNN (FP32 Source - Fix Shape)
 
 on:
   workflow_dispatch:
@@ -19,12 +19,13 @@ jobs:
       - name: Install deps and download ONNX (FP32!)
         run: |
           pip install onnx onnxsim
-          # ĐỔI TÊN: Bỏ đuôi _fp16 và op18 để lấy file FP32 chuẩn
           wget -O 2xParagonSR_Nano_gan.onnx https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx
+          ls -lh 2xParagonSR_Nano_gan.onnx
 
-      - name: Simplify ONNX
+      - name: Simplify ONNX (FREEZE SHAPES)
         run: |
-          python -m onnxsim 2xParagonSR_Nano_gan.onnx 2xParagonSR_Nano_gan_sim.onnx || \
+          # QUAN TRỌNG: Thêm --input-shape để đóng băng các node Shape động thành hằng số
+          python -m onnxsim 2xParagonSR_Nano_gan.onnx 2xParagonSR_Nano_gan_sim.onnx --input-shape "input:1,3,256,256" || \
             cp 2xParagonSR_Nano_gan.onnx 2xParagonSR_Nano_gan_sim.onnx
 
       - name: Download NCNN tools
@@ -40,24 +41,17 @@ jobs:
 
       - name: Convert ONNX to NCNN
         run: |
-          # Check if onnx file exists and has reasonable size (> 10KB)
-          FILE_SIZE=$(stat -c%s "2xParagonSR_Nano_gan_sim.onnx")
-          if [ "$FILE_SIZE" -lt 10000 ]; then
-            echo "ERROR: ONNX file is too small ($FILE_SIZE bytes), download failed!"
-            exit 1
-          fi
-
-          # Convert
+          # B1: Convert
           ./ncnn-20240820-ubuntu-2204/bin/onnx2ncnn 2xParagonSR_Nano_gan_sim.onnx 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
           
-          # Check if bin file is valid (> 10KB)
+          # B2: Check if bin is valid (> 50KB, before it was only 9KB)
           BIN_SIZE=$(stat -c%s "2xParagonSR_Nano_gan.bin")
-          if [ "$BIN_SIZE" -lt 10000 ]; then
+          if [ "$BIN_SIZE" -lt 50000 ]; then
             echo "ERROR: NCNN .bin file is too small ($BIN_SIZE bytes), conversion failed!"
             exit 1
           fi
 
-          # Optimize
+          # B3: Optimize
           ./ncnn-20240820-ubuntu-2204/bin/ncnnoptimize 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin 2xParagonSR_Nano_gan_opt.param 2xParagonSR_Nano_gan_opt.bin 65536
           
           mv 2xParagonSR_Nano_gan_opt.param 2xParagonSR_Nano_gan.param
@@ -70,7 +64,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: 2xParagonSR_Nano_gan_ncnn_fp32source
+          name: 2xParagonSR_Nano_gan_ncnn_fixed
           path: |
             2xParagonSR_Nano_gan.param
             2xParagonSR_Nano_gan.bin
