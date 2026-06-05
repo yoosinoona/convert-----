@@ -1,0 +1,359 @@
+name: Convert 2xParagonSR_Nano_gan (Definitive Fix)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  convert:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Python deps
+        run: pip install onnx onnxsim numpy
+
+      - name: Download ONNX model
+        run: |
+          wget -q -O net_g.onnx \
+            "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx"
+          wget -q -O net_g.onnx.data \
+            "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx.data"
+          ls -lh net_g.onnx net_g.onnx.data
+
+      - name: Merge external data
+        run: |
+          python3 << 'PYEOF'
+          import onnx
+          print("Loading ONNX with external data...")
+          model = onnx.load("net_g.onnx")
+          onnx.save(model, "merged.onnx", save_as_external_data=False)
+          print("Merged OK")
+          PYEOF
+
+      - name: Fix Dynamic Split in ONNX (ROOT CAUSE FIX)
+        run: |
+          python3 << 'PYEOF'
+          import onnx
+          from onnx import helper, numpy_helper
+          import numpy as np
+
+          print("Fixing Dynamic Split nodes in ONNX...")
+          model = onnx.load("merged.onnx")
+
+          # Lấy tất cả hằng số/initializer để tìm kích thước split
+          const_vals = {}
+          for init in model.graph.initializer:
+              const_vals[init.name] = numpy_helper.to_array(init)
+          for node in model.graph.node:
+              if node.op_type == "Constant":
+                  for attr in node.attribute:
+                      if attr.name == "value":
+                          const_vals[node.output[0]] = numpy_helper.to_array(attr.t)
+
+          new_nodes = []
+          fixed_count = 0
+          for node in model.graph.node:
+              if node.op_type == "Split":
+                  split_sizes = None
+                  axis = 0
+                  
+                  # Tìm axis và split sizes từ attribute (opset cũ)
+                  for attr in node.attribute:
+                      if attr.name == "axis": axis = attr.i
+                      if attr.name == "split": split_sizes = list(attr.ints)
+                  
+                  # Tìm từ inputs (opset 13+)
+                  if split_sizes is None and len(node.input) >= 2 and node.input[1] != '':
+                      split_input_name = node.input[1]
+                      if split_input_name in const_vals:
+                          split_sizes = const_vals[split_input_name].tolist()
+                  
+                  if len(node.input) >= 3 and node.input[2] != '':
+                      axis_input_name = node.input[2]
+                      if axis_input_name in const_vals:
+                          axis = int(const_vals[axis_input_name])
+
+                  # Nếu tìm được kích thước tĩnh, thay bằng Slice
+                  if split_sizes is not None:
+                      starts = [0]
+                      for s in split_sizes:
+                          starts.append(starts[-1] + s)
+                      
+                      for i, out_name in enumerate(node.output):
+                          start_name = f"{out_name}_start"
+                          end_name = f"{out_name}_end"
+                          axis_name = f"{out_name}_axis"
+                          
+                          # Đưa kích thước vào initializer của ONNX
+                          model.graph.initializer.extend([
+                              numpy_helper.from_array(np.array([starts[i]], dtype=np.int64), start_name),
+                              numpy_helper.from_array(np.array([starts[i+1]], dtype=np.int64), end_name),
+                              numpy_helper.from_array(np.array([axis], dtype=np.int64), axis_name)
+                          ])
+                          
+                          # Tạo node Slice tĩnh
+                          slice_node = helper.make_node(
+                              "Slice",
+                              inputs=[node.input[0], start_name, end_name, axis_name],
+                              outputs=[out_name]
+                          )
+                          new_nodes.append(slice_node)
+                      
+                      fixed_count += 1
+                  else:
+                      new_nodes.append(node)
+              else:
+                  new_nodes.append(node)
+
+          del model.graph.node[:]
+          model.graph.node.extend(new_nodes)
+          onnx.save(model, "fixed.onnx")
+          print(f"✅ Replaced {fixed_count} dynamic Split nodes with static Slice nodes in ONNX")
+          PYEOF
+
+      - name: Simplify ONNX
+        run: |
+          python -m onnxsim fixed.onnx model_final.onnx --input-shape "input:1,3,256,256"
+          ls -lh model_final.onnx
+
+      - name: Download ncnn tools & install deps
+        run: |
+          wget -q "https://github.com/Tencent/ncnn/releases/download/20240820/ncnn-20240820-ubuntu-2204.zip"
+          unzip -q ncnn-20240820-ubuntu-2204.zip
+          chmod +x ncnn-20240820-ubuntu-2204/bin/*
+          wget -q "http://archive.ubuntu.com/ubuntu/pool/main/p/protobuf/libprotobuf23_3.12.4-1ubuntu7_amd64.deb"
+          sudo dpkg -i libprotobuf23_3.12.4-1ubuntu7_amd64.deb || true
+
+      - name: Convert ONNX to NCNN
+        run: |
+          ONNX2NCNN=./ncnn-20240820-ubuntu-2204/bin/onnx2ncnn
+          $ONNX2NCNN model_final.onnx raw.param raw.bin 2>&1
+
+          if [ ! -f "raw.param" ] || [ ! -f "raw.bin" ]; then
+            echo "ERROR: onnx2ncnn failed!"
+            exit 1
+          fi
+          echo "=== onnx2ncnn OK ==="
+          ls -lh raw.param raw.bin
+
+      - name: Post-process & validate
+        run: |
+          cp raw.param 2xParagonSR_Nano_gan.param
+          cp raw.bin    2xParagonSR_Nano_gan.bin
+
+          # DepthToSpace → PixelShuffle
+          if grep -q "DepthToSpace" 2xParagonSR_Nano_gan.param; then
+            echo "Replacing DepthToSpace → PixelShuffle..."
+            sed -i 's/DepthToSpace/PixelShuffle/g' 2xParagonSR_Nano_gan.param
+          fi
+
+          echo "=== Final Param Validation ==="
+          head -3 2xParagonSR_Nano_gan.param
+          
+          if grep -q "\-23300=4,\-233" 2xParagonSR_Nano_gan.param || grep -q "Crop.*\-23309" 2xParagonSR_Nano_gan.param; then
+            echo "⚠️ WARNING: File still contains dynamic patterns!"
+          else
+            echo "✅ Model is completely clean!"
+          fi
+
+          echo "Slice layers: $(grep -c 'Slice' 2xParagonSR_Nano_gan.param || echo 0)"
+          echo "Mish layers: $(grep -c 'Mish' 2xParagonSR_Nano_gan.param || echo 0)"
+
+          echo ""
+          echo "=== CONVERSION SUCCESS ==="
+          ls -lh 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: 2xParagonSR_Nano_gan_ncnn_definitive
+          path: |
+            2xParagonSR_Nano_gan.param
+            2xParagonSR_Nano_gan.bin
+          retention-days: 90name: Convert 2xParagonSR_Nano_gan (Definitive Fix)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  convert:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Python deps
+        run: pip install onnx onnxsim numpy
+
+      - name: Download ONNX model
+        run: |
+          wget -q -O net_g.onnx \
+            "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx"
+          wget -q -O net_g.onnx.data \
+            "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx.data"
+          ls -lh net_g.onnx net_g.onnx.data
+
+      - name: Merge external data
+        run: |
+          python3 << 'PYEOF'
+          import onnx
+          print("Loading ONNX with external data...")
+          model = onnx.load("net_g.onnx")
+          onnx.save(model, "merged.onnx", save_as_external_data=False)
+          print("Merged OK")
+          PYEOF
+
+      - name: Fix Dynamic Split in ONNX (ROOT CAUSE FIX)
+        run: |
+          python3 << 'PYEOF'
+          import onnx
+          from onnx import helper, numpy_helper
+          import numpy as np
+
+          print("Fixing Dynamic Split nodes in ONNX...")
+          model = onnx.load("merged.onnx")
+
+          # Lấy tất cả hằng số/initializer để tìm kích thước split
+          const_vals = {}
+          for init in model.graph.initializer:
+              const_vals[init.name] = numpy_helper.to_array(init)
+          for node in model.graph.node:
+              if node.op_type == "Constant":
+                  for attr in node.attribute:
+                      if attr.name == "value":
+                          const_vals[node.output[0]] = numpy_helper.to_array(attr.t)
+
+          new_nodes = []
+          fixed_count = 0
+          for node in model.graph.node:
+              if node.op_type == "Split":
+                  split_sizes = None
+                  axis = 0
+                  
+                  # Tìm axis và split sizes từ attribute (opset cũ)
+                  for attr in node.attribute:
+                      if attr.name == "axis": axis = attr.i
+                      if attr.name == "split": split_sizes = list(attr.ints)
+                  
+                  # Tìm từ inputs (opset 13+)
+                  if split_sizes is None and len(node.input) >= 2 and node.input[1] != '':
+                      split_input_name = node.input[1]
+                      if split_input_name in const_vals:
+                          split_sizes = const_vals[split_input_name].tolist()
+                  
+                  if len(node.input) >= 3 and node.input[2] != '':
+                      axis_input_name = node.input[2]
+                      if axis_input_name in const_vals:
+                          axis = int(const_vals[axis_input_name])
+
+                  # Nếu tìm được kích thước tĩnh, thay bằng Slice
+                  if split_sizes is not None:
+                      starts = [0]
+                      for s in split_sizes:
+                          starts.append(starts[-1] + s)
+                      
+                      for i, out_name in enumerate(node.output):
+                          start_name = f"{out_name}_start"
+                          end_name = f"{out_name}_end"
+                          axis_name = f"{out_name}_axis"
+                          
+                          # Đưa kích thước vào initializer của ONNX
+                          model.graph.initializer.extend([
+                              numpy_helper.from_array(np.array([starts[i]], dtype=np.int64), start_name),
+                              numpy_helper.from_array(np.array([starts[i+1]], dtype=np.int64), end_name),
+                              numpy_helper.from_array(np.array([axis], dtype=np.int64), axis_name)
+                          ])
+                          
+                          # Tạo node Slice tĩnh
+                          slice_node = helper.make_node(
+                              "Slice",
+                              inputs=[node.input[0], start_name, end_name, axis_name],
+                              outputs=[out_name]
+                          )
+                          new_nodes.append(slice_node)
+                      
+                      fixed_count += 1
+                  else:
+                      new_nodes.append(node)
+              else:
+                  new_nodes.append(node)
+
+          del model.graph.node[:]
+          model.graph.node.extend(new_nodes)
+          onnx.save(model, "fixed.onnx")
+          print(f"✅ Replaced {fixed_count} dynamic Split nodes with static Slice nodes in ONNX")
+          PYEOF
+
+      - name: Simplify ONNX
+        run: |
+          python -m onnxsim fixed.onnx model_final.onnx --input-shape "input:1,3,256,256"
+          ls -lh model_final.onnx
+
+      - name: Download ncnn tools & install deps
+        run: |
+          wget -q "https://github.com/Tencent/ncnn/releases/download/20240820/ncnn-20240820-ubuntu-2204.zip"
+          unzip -q ncnn-20240820-ubuntu-2204.zip
+          chmod +x ncnn-20240820-ubuntu-2204/bin/*
+          wget -q "http://archive.ubuntu.com/ubuntu/pool/main/p/protobuf/libprotobuf23_3.12.4-1ubuntu7_amd64.deb"
+          sudo dpkg -i libprotobuf23_3.12.4-1ubuntu7_amd64.deb || true
+
+      - name: Convert ONNX to NCNN
+        run: |
+          ONNX2NCNN=./ncnn-20240820-ubuntu-2204/bin/onnx2ncnn
+          $ONNX2NCNN model_final.onnx raw.param raw.bin 2>&1
+
+          if [ ! -f "raw.param" ] || [ ! -f "raw.bin" ]; then
+            echo "ERROR: onnx2ncnn failed!"
+            exit 1
+          fi
+          echo "=== onnx2ncnn OK ==="
+          ls -lh raw.param raw.bin
+
+      - name: Post-process & validate
+        run: |
+          cp raw.param 2xParagonSR_Nano_gan.param
+          cp raw.bin    2xParagonSR_Nano_gan.bin
+
+          # DepthToSpace → PixelShuffle
+          if grep -q "DepthToSpace" 2xParagonSR_Nano_gan.param; then
+            echo "Replacing DepthToSpace → PixelShuffle..."
+            sed -i 's/DepthToSpace/PixelShuffle/g' 2xParagonSR_Nano_gan.param
+          fi
+
+          echo "=== Final Param Validation ==="
+          head -3 2xParagonSR_Nano_gan.param
+          
+          if grep -q "\-23300=4,\-233" 2xParagonSR_Nano_gan.param || grep -q "Crop.*\-23309" 2xParagonSR_Nano_gan.param; then
+            echo "⚠️ WARNING: File still contains dynamic patterns!"
+          else
+            echo "✅ Model is completely clean!"
+          fi
+
+          echo "Slice layers: $(grep -c 'Slice' 2xParagonSR_Nano_gan.param || echo 0)"
+          echo "Mish layers: $(grep -c 'Mish' 2xParagonSR_Nano_gan.param || echo 0)"
+
+          echo ""
+          echo "=== CONVERSION SUCCESS ==="
+          ls -lh 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: 2xParagonSR_Nano_gan_ncnn_definitive
+          path: |
+            2xParagonSR_Nano_gan.param
+            2xParagonSR_Nano_gan.bin
+          retention-days: 90
