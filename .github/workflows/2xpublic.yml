@@ -27,7 +27,7 @@ env:
   RELEASE_TAG: '2xPublic_realplksr_dysample_layernorm_real'
   REPO_OWNER: 'Phhofm'
   REPO_NAME: 'models'
-  NCNN_VERSION: '20250507'
+  NCNN_VERSION: '20250428'
 
 jobs:
   convert:
