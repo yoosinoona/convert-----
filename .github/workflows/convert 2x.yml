@@ -1,4 +1,4 @@
-name: Convert 2xParagonSR_Nano_gan (Final Auto-Fix)
+name: Convert 2xParagonSR_Nano_gan (PNNX)
 
 on:
   workflow_dispatch:
@@ -41,141 +41,37 @@ jobs:
           python -m onnxsim merged.onnx model_final.onnx --input-shape "input:1,3,256,256" 2>&1 || cp merged.onnx model_final.onnx
           ls -lh model_final.onnx
 
-      - name: Download ncnn tools & install deps
+      - name: Install PNNX
+        run: pip install pnnx
+
+      - name: Convert ONNX to NCNN using PNNX
         run: |
-          wget -q "https://github.com/Tencent/ncnn/releases/download/20240820/ncnn-20240820-ubuntu-2204.zip"
-          unzip -q ncnn-20240820-ubuntu-2204.zip
-          chmod +x ncnn-20240820-ubuntu-2204/bin/*
-          wget -q "http://archive.ubuntu.com/ubuntu/pool/main/p/protobuf/libprotobuf23_3.12.4-1ubuntu7_amd64.deb"
-          sudo dpkg -i libprotobuf23_3.12.4-1ubuntu7_amd64.deb || true
+          # Chạy PNNX với file ONNX đã simplify
+          pnnx model_final.onnx
+          
+          # PNNX sẽ tạo ra một thư mục có tên dạng model_final_pnnx
+          # Bên trong chứa file .param và .bin
+          echo "=== Checking PNNX output ==="
+          ls -lR model_final_pnnx/
+          
+          # Copy file ra ngoài và đổi tên cho chuẩn
+          cp model_final_pnnx/model_final.ncnn.param 2xParagonSR_Nano_gan.param
+          cp model_final_pnnx/model_final.ncnn.bin    2xParagonSR_Nano_gan.bin
 
-      - name: Convert ONNX to NCNN
+      - name: Final validation
         run: |
-          ONNX2NCNN=./ncnn-20240820-ubuntu-2204/bin/onnx2ncnn
-          $ONNX2NCNN model_final.onnx raw.param raw.bin 2>&1
-          if [ ! -f "raw.param" ] || [ ! -f "raw.bin" ]; then echo "ERROR: onnx2ncnn failed!"; exit 1; fi
-          echo "=== onnx2ncnn OK ==="
-
-      - name: Auto-Fix NCNN Param (The Ultimate Text Fix)
-        run: |
-          python3 << 'PYEOF'
-          import re
-
-          def ultimate_fix(input_file, output_file):
-              with open(input_file, 'r') as f:
-                  lines = f.readlines()
-              
-              new_lines = []
-              added_slices = 0
-              removed_dynamic = 0
-              splits = [(0, 15), (15, 18), (18, 21), (21, 24)]
-              
-              for line in lines:
-                  parts = line.strip().split()
-                  
-                  # 1. Xóa rác val_24
-                  if 'val_24' in line and parts[0] in ['MemoryData', 'Split']:
-                      continue
-                  
-                  # 2. Sửa Slice động (-23300=4,-233...)
-                  if len(parts) > 5 and parts[0] == 'Slice' and '-23300=4,-233,-233,-233,-233' in parts:
-                      node_name = parts[1]
-                      num_inputs = int(parts[2])
-                      num_outputs = int(parts[3])
-                      data_blob = parts[4] # group_norm
-                      output_blobs = parts[4+num_inputs : 4+num_inputs+num_outputs]
-                      
-                      for i, out_blob in enumerate(output_blobs):
-                          start, end = splits[i]
-                          static_slice_line = f"Slice            {node_name}_{i} 1 1 {data_blob} {out_blob} -23300=1,{start} -23301=1,{end} -23302=1,0\n"
-                          new_lines.append(static_slice_line)
-                          added_slices += 1
-                      removed_dynamic += 1
-
-                  # 3. Sửa Crop động (-23309=1,0 -23310=1,15...)
-                  elif len(parts) > 5 and parts[0] == 'Crop' and '-23309=1,0' in parts and '-23310=1,15' in parts:
-                      node_name = parts[1]
-                      num_inputs = int(parts[2])
-                      num_outputs = int(parts[3])
-                      # Ở Crop, input[0] thường là group_norm_splitncnn_X
-                      # Ta phải truy ngược lại, nhưng vì đã xóa Split ở bước 1, 
-                      # ta thay thẳng bằng group_norm. Cách an toàn là lấy đuôi blob.
-                      input_blob = parts[4] 
-                      output_blobs = parts[4+num_inputs : 4+num_inputs+num_outputs]
-                      
-                      # Trong file của bạn, Crop input là group_norm_splitncnn_X
-                      # Ta cần đổi nó thành group_norm
-                      if "group_norm" in input_blob:
-                          data_blob = "group_norm" # Fallback về group_norm
-                      else:
-                          data_blob = input_blob
-
-                      for i, out_blob in enumerate(output_blobs):
-                          start, end = splits[i]
-                          static_slice_line = f"Slice            {node_name}_{i} 1 1 {data_blob} {out_blob} -23300=1,{start} -23301=1,{end} -23302=1,0\n"
-                          new_lines.append(static_slice_line)
-                          added_slices += 1
-                      removed_dynamic += 1
-                      
-                  else:
-                      new_lines.append(line)
-              
-              # 4. Cập nhật Header (Layer count)
-              magic = new_lines[0].strip()
-              blob_count = new_lines[1].strip().split()[1]
-              actual_layers = len(new_lines) - 2
-              new_lines[1] = f"{actual_layers} {blob_count}\n"
-              
-              with open(output_file, 'w') as f:
-                  f.writelines(new_lines)
-                  
-              print(f"✅ Ultimate Fix Applied! Removed {removed_dynamic} dynamic nodes, added {added_slices} static Slice nodes.")
-              print(f"Final Layer Count: {actual_layers}")
-
-          ultimate_fix('raw.param', '2xParagonSR_Nano_gan.param')
-          PYEOF
-
-      - name: Post-process & clean orphan nodes
-        run: |
-          cp raw.param 2xParagonSR_Nano_gan.param
-          cp raw.bin    2xParagonSR_Nano_gan.bin
-
-          # DepthToSpace → PixelShuffle
+          # DepthToSpace → PixelShuffle (PNNX thường tự xử lý, nhưng cứ sed cho chắc)
           if grep -q "DepthToSpace" 2xParagonSR_Nano_gan.param; then
             sed -i 's/DepthToSpace/PixelShuffle/g' 2xParagonSR_Nano_gan.param
           fi
 
-          # ★ Xóa 2 dòng rác val_24 (MemoryData và Split)
-          sed -i '/MemoryData.*val_24/d' 2xParagonSR_Nano_gan.param
-          sed -i '/Split.*splitncnn_0.*val_24/d' 2xParagonSR_Nano_gan.param
-
-          # ★ Cập nhật lại số layer và blob trong header
-          python3 << 'PYEOF'
-          with open('2xParagonSR_Nano_gan.param', 'r') as f:
-              lines = f.readlines()
-          
-          # Đếm lại số layer thực tế (trừ 2 dòng header)
-          actual_layers = len(lines) - 2
-          
-          # Đếm số blob duy nhất (cập nhật số thứ 2 ở dòng 2)
-          # Cách đơn giản nhất là giữ nguyên số blob cũ, NCNN tự bỏ qua blob không dùng
-          counts = lines[1].strip().split()
-          old_blobs = counts[1]
-          
-          lines[1] = f"{actual_layers} {old_blobs}\n"
-          
-          with open('2xParagonSR_Nano_gan.param', 'w') as f:
-              f.writelines(lines)
-          print(f"✅ Cleaned orphan nodes. Updated layer count to {actual_layers}")
-          PYEOF
-
           echo "=== Final Param Validation ==="
           head -3 2xParagonSR_Nano_gan.param
           
-          if grep -q "\-23300=4,\-233" 2xParagonSR_Nano_gan.param || grep -q "val_24" 2xParagonSR_Nano_gan.param; then
-            echo "⚠️ WARNING: File still contains dynamic patterns or orphans!"
+          if grep -q "\-23300=4,\-233" 2xParagonSR_Nano_gan.param || grep -q "Crop.*\-23309" 2xParagonSR_Nano_gan.param; then
+            echo "⚠️ WARNING: File still contains dynamic patterns!"
           else
-            echo "✅ Model is completely clean!"
+            echo "✅ Model is completely clean from dynamic Slice/Crop!"
           fi
 
           echo "=== CONVERSION SUCCESS ==="
@@ -184,7 +80,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: 2xParagonSR_Nano_gan_ncnn_definitive
+          name: 2xParagonSR_Nano_gan_ncnn_pnnx
           path: |
             2xParagonSR_Nano_gan.param
             2xParagonSR_Nano_gan.bin
