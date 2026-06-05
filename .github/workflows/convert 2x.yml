@@ -1,184 +1,78 @@
-name: Convert 2xParagonSR_Nano_gan (Final Auto-Fix)
-
-on:
-  workflow_dispatch:
-
-jobs:
-  convert:
-    runs-on: ubuntu-22.04
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install Python deps
-        run: pip install onnx onnxsim numpy
-
-      - name: Download ONNX model
-        run: |
-          wget -q "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx"
-          wget -q "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx.data"
-          cp 2xParagonSR_Nano_gan_op18_fp32.onnx.data net_g_75000_fused_op18_fp32.onnx.data
-
-      - name: Merge external data
-        run: |
-          python3 << 'PYEOF'
-          import onnx
-          import os
-          print("Loading ONNX with external data...")
-          model = onnx.load("2xParagonSR_Nano_gan_op18_fp32.onnx", load_external_data=True)
-          onnx.save(model, "merged.onnx", save_as_external_data=False)
-          print(f"Merged OK! Size: {os.path.getsize('merged.onnx') / (1024*1024):.1f} MB")
-          PYEOF
-
-      - name: Simplify ONNX
-        run: |
-          python -m onnxsim merged.onnx model_final.onnx --input-shape "input:1,3,256,256" 2>&1 || cp merged.onnx model_final.onnx
-          ls -lh model_final.onnx
-
-      - name: Download ncnn tools & install deps
-        run: |
-          wget -q "https://github.com/Tencent/ncnn/releases/download/20240820/ncnn-20240820-ubuntu-2204.zip"
-          unzip -q ncnn-20240820-ubuntu-2204.zip
-          chmod +x ncnn-20240820-ubuntu-2204/bin/*
-          wget -q "http://archive.ubuntu.com/ubuntu/pool/main/p/protobuf/libprotobuf23_3.12.4-1ubuntu7_amd64.deb"
-          sudo dpkg -i libprotobuf23_3.12.4-1ubuntu7_amd64.deb || true
-
-      - name: Convert ONNX to NCNN
-        run: |
-          ONNX2NCNN=./ncnn-20240820-ubuntu-2204/bin/onnx2ncnn
-          $ONNX2NCNN model_final.onnx raw.param raw.bin 2>&1
-          if [ ! -f "raw.param" ] || [ ! -f "raw.bin" ]; then echo "ERROR: onnx2ncnn failed!"; exit 1; fi
-          echo "=== onnx2ncnn OK ==="
-
-      - name: Auto-Fix NCNN Param (Dynamic Slice/Crop -> Static Slice)
+      - name: Auto-Fix NCNN Param (The Ultimate Text Fix)
         run: |
           python3 << 'PYEOF'
           import re
 
-          def fix_ncnn_param(input_file, output_file):
+          def ultimate_fix(input_file, output_file):
               with open(input_file, 'r') as f:
                   lines = f.readlines()
-
-              magic = lines[0].strip()
-              counts = lines[1].strip().split()
-              layer_count = int(counts[0])
-              blob_count = counts[1]
-
-              new_lines = [lines[0], lines[1]]
-              fixed_count = 0
-              # Tỉ lệ cắt channel cố định của model này
+              
+              new_lines = []
+              added_slices = 0
+              removed_dynamic = 0
               splits = [(0, 15), (15, 18), (18, 21), (21, 24)]
-
-              for line in lines[2:]:
+              
+              for line in lines:
                   parts = line.strip().split()
                   
-                  # Trường hợp 1: Slice động có tham số -23300=4,-233,-233,-233,-233
+                  # 1. Xóa rác val_24
+                  if 'val_24' in line and parts[0] in ['MemoryData', 'Split']:
+                      continue
+                  
+                  # 2. Sửa Slice động (-23300=4,-233...)
                   if len(parts) > 5 and parts[0] == 'Slice' and '-23300=4,-233,-233,-233,-233' in parts:
                       node_name = parts[1]
                       num_inputs = int(parts[2])
                       num_outputs = int(parts[3])
-                      input_blobs = parts[4:4+num_inputs]
-                      output_blobs = parts[4+num_inputs:4+num_inputs+num_outputs]
-
-                      data_blob = input_blobs[0] # Thường là group_norm
-
+                      data_blob = parts[4] # group_norm
+                      output_blobs = parts[4+num_inputs : 4+num_inputs+num_outputs]
+                      
                       for i, out_blob in enumerate(output_blobs):
                           start, end = splits[i]
                           static_slice_line = f"Slice            {node_name}_{i} 1 1 {data_blob} {out_blob} -23300=1,{start} -23301=1,{end} -23302=1,0\n"
                           new_lines.append(static_slice_line)
-                      
-                      fixed_count += 1
-                      
-                  # Trường hợp 2: Crop động có tham số -23309=1,0 -23310=1,15 -23311=1,0 (phiên bản onnx2ncnn cũ)
+                          added_slices += 1
+                      removed_dynamic += 1
+
+                  # 3. Sửa Crop động (-23309=1,0 -23310=1,15...)
                   elif len(parts) > 5 and parts[0] == 'Crop' and '-23309=1,0' in parts and '-23310=1,15' in parts:
                       node_name = parts[1]
                       num_inputs = int(parts[2])
                       num_outputs = int(parts[3])
-                      input_blobs = parts[4:4+num_inputs]
-                      output_blobs = parts[4+num_inputs:4+num_inputs+num_outputs]
-
-                      # Đối với Crop, input[0] là tensor đã split, ta cần nối về group_norm
-                      # Vì ta sẽ xóa node Split ngay trước đó, nên input[0] chính là group_norm
-                      data_blob = input_blobs[0] 
+                      # Ở Crop, input[0] thường là group_norm_splitncnn_X
+                      # Ta phải truy ngược lại, nhưng vì đã xóa Split ở bước 1, 
+                      # ta thay thẳng bằng group_norm. Cách an toàn là lấy đuôi blob.
+                      input_blob = parts[4] 
+                      output_blobs = parts[4+num_inputs : 4+num_inputs+num_outputs]
                       
+                      # Trong file của bạn, Crop input là group_norm_splitncnn_X
+                      # Ta cần đổi nó thành group_norm
+                      if "group_norm" in input_blob:
+                          data_blob = "group_norm" # Fallback về group_norm
+                      else:
+                          data_blob = input_blob
+
                       for i, out_blob in enumerate(output_blobs):
                           start, end = splits[i]
                           static_slice_line = f"Slice            {node_name}_{i} 1 1 {data_blob} {out_blob} -23300=1,{start} -23301=1,{end} -23302=1,0\n"
                           new_lines.append(static_slice_line)
+                          added_slices += 1
+                      removed_dynamic += 1
                       
-                      fixed_count += 1
                   else:
                       new_lines.append(line)
-
-              # Cập nhật số lượng layer: Mỗi lần fix xóa 1 node, thêm 4 node -> cộng thêm 3
-              new_layer_count = layer_count + 3 * fixed_count
-              new_lines[1] = f"{new_layer_count} {blob_count}\n"
-
+              
+              # 4. Cập nhật Header (Layer count)
+              magic = new_lines[0].strip()
+              blob_count = new_lines[1].strip().split()[1]
+              actual_layers = len(new_lines) - 2
+              new_lines[1] = f"{actual_layers} {blob_count}\n"
+              
               with open(output_file, 'w') as f:
                   f.writelines(new_lines)
                   
-              print(f"✅ Auto-Fixed Param: Replaced {fixed_count} dynamic Slice/Crop nodes with static Slice nodes.")
+              print(f"✅ Ultimate Fix Applied! Removed {removed_dynamic} dynamic nodes, added {added_slices} static Slice nodes.")
+              print(f"Final Layer Count: {actual_layers}")
 
-          fix_ncnn_param('raw.param', '2xParagonSR_Nano_gan.param')
+          ultimate_fix('raw.param', '2xParagonSR_Nano_gan.param')
           PYEOF
-
-      - name: Post-process & clean orphan nodes
-        run: |
-          cp raw.param 2xParagonSR_Nano_gan.param
-          cp raw.bin    2xParagonSR_Nano_gan.bin
-
-          # DepthToSpace → PixelShuffle
-          if grep -q "DepthToSpace" 2xParagonSR_Nano_gan.param; then
-            sed -i 's/DepthToSpace/PixelShuffle/g' 2xParagonSR_Nano_gan.param
-          fi
-
-          # ★ Xóa 2 dòng rác val_24 (MemoryData và Split)
-          sed -i '/MemoryData.*val_24/d' 2xParagonSR_Nano_gan.param
-          sed -i '/Split.*splitncnn_0.*val_24/d' 2xParagonSR_Nano_gan.param
-
-          # ★ Cập nhật lại số layer và blob trong header
-          python3 << 'PYEOF'
-          with open('2xParagonSR_Nano_gan.param', 'r') as f:
-              lines = f.readlines()
-          
-          # Đếm lại số layer thực tế (trừ 2 dòng header)
-          actual_layers = len(lines) - 2
-          
-          # Đếm số blob duy nhất (cập nhật số thứ 2 ở dòng 2)
-          # Cách đơn giản nhất là giữ nguyên số blob cũ, NCNN tự bỏ qua blob không dùng
-          counts = lines[1].strip().split()
-          old_blobs = counts[1]
-          
-          lines[1] = f"{actual_layers} {old_blobs}\n"
-          
-          with open('2xParagonSR_Nano_gan.param', 'w') as f:
-              f.writelines(lines)
-          print(f"✅ Cleaned orphan nodes. Updated layer count to {actual_layers}")
-          PYEOF
-
-          echo "=== Final Param Validation ==="
-          head -3 2xParagonSR_Nano_gan.param
-          
-          if grep -q "\-23300=4,\-233" 2xParagonSR_Nano_gan.param || grep -q "val_24" 2xParagonSR_Nano_gan.param; then
-            echo "⚠️ WARNING: File still contains dynamic patterns or orphans!"
-          else
-            echo "✅ Model is completely clean!"
-          fi
-
-          echo "=== CONVERSION SUCCESS ==="
-          ls -lh 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: 2xParagonSR_Nano_gan_ncnn_definitive
-          path: |
-            2xParagonSR_Nano_gan.param
-            2xParagonSR_Nano_gan.bin
-          retention-days: 90
