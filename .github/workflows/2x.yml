@@ -99,61 +99,72 @@ jobs:
               with open(input_file, 'r') as f:
                   lines = f.readlines()
 
-              header = lines[0].strip().split()
-              magic = header[0]
-              layer_count = int(header[1])
-              blob_count = header[2]
+              # Đúng format NCNN: Dòng 1 là magic, Dòng 2 là layer_count blob_count
+              magic = lines[0].strip()
+              counts = lines[1].strip().split()
+              layer_count = int(counts[0])
+              blob_count = counts[1]
 
-              # Tìm tất cả node Split và Crop
               split_map = {}   # output_blob -> input_blob
-              split_lines = {} # line_index -> line_content
-              crop_lines = {}  # line_index -> info_dict
+              split_indices = set()
+              crop_info_map = {} # line_index -> info_dict
 
-              for i, line in enumerate(lines):
+              # Duyệt từ dòng thứ 3 (index 2) trở đi
+              for i in range(2, len(lines)):
+                  line = lines[i]
                   parts = line.strip().split()
-                  if len(parts) < 2: continue
+                  if len(parts) < 5: continue
                   
                   op_type = parts[0]
                   
                   if op_type == 'Split':
+                      num_inputs = int(parts[2])
                       num_outputs = int(parts[3])
-                      input_blob = parts[4]
-                      output_blobs = parts[5:5+num_outputs]
-                      for ob in output_blobs:
-                          split_map[ob] = input_blob
-                      split_lines[i] = line
+                      input_blobs = parts[4:4+num_inputs]
+                      output_blobs = parts[4+num_inputs:4+num_inputs+num_outputs]
+                      
+                      input_blob = input_blobs[0] if input_blobs else None
+                      if input_blob:
+                          for ob in output_blobs:
+                              split_map[ob] = input_blob
+                      split_indices.add(i)
                       
                   elif op_type == 'Crop':
-                      # Tìm pattern động: -23309=1,X -23310=1,Y -23311=1,0
                       match = re.search(r'-23309=1,(\d+)\s+-23310=1,(\d+)\s+-23311=1,0', line)
                       if match:
+                          num_inputs = int(parts[2])
+                          num_outputs = int(parts[3])
+                          input_blobs = parts[4:4+num_inputs]
+                          output_blobs = parts[4+num_inputs:4+num_inputs+num_outputs]
+                          
                           node_name = parts[1]
-                          input_blob = parts[4]
-                          output_blob = parts[5]
-                          start_ch = match.group(1)
-                          end_ch = match.group(2)
-                          crop_lines[i] = {
-                              'name': node_name,
-                              'input': input_blob,
-                              'output': output_blob,
-                              'start': start_ch,
-                              'end': end_ch
-                          }
+                          input_blob = input_blobs[0] if input_blobs else None
+                          output_blob = output_blobs[0] if output_blobs else None
+                          
+                          if input_blob and output_blob:
+                              crop_info_map[i] = {
+                                  'name': node_name,
+                                  'input': input_blob,
+                                  'output': output_blob,
+                                  'start': match.group(1),
+                                  'end': match.group(2)
+                              }
 
-              # Xác định các node Split cần xóa (chỉ khi tất cả output của nó đều đi vào Crop lỗi)
+              # Xác định các node Split cần xóa (chỉ xóa khi tất cả output đều đi vào Crop lỗi)
               lines_to_remove = set()
               removed_splits = 0
               
-              for idx, line in split_lines.items():
+              for idx in split_indices:
+                  line = lines[idx]
                   parts = line.strip().split()
+                  num_inputs = int(parts[2])
                   num_outputs = int(parts[3])
-                  output_blobs = parts[5:5+num_outputs]
+                  output_blobs = parts[4+num_inputs:4+num_inputs+num_outputs]
                   
                   can_remove = True
                   for ob in output_blobs:
-                      # Kiểm tra xem output này có được dùng bởi Crop lỗi không
                       is_used_by_our_crop = False
-                      for crop_info in crop_lines.values():
+                      for crop_info in crop_info_map.values():
                           if crop_info['input'] == ob:
                               is_used_by_our_crop = True
                               break
@@ -167,17 +178,15 @@ jobs:
 
               # Ghi file mới
               new_layer_count = layer_count - removed_splits
-              new_lines = [f"{magic} {new_layer_count} {blob_count}\n"]
+              new_lines = [f"{magic}\n", f"{new_layer_count} {blob_count}\n"]
               
               replaced_crops = 0
-              for i, line in enumerate(lines):
-                  if i == 0: continue # Bỏ header cũ
-                  
+              for i in range(2, len(lines)):
                   if i in lines_to_remove:
                       continue # Xóa node Split
                       
-                  if i in crop_lines:
-                      crop_info = crop_lines[i]
+                  if i in crop_info_map:
+                      crop_info = crop_info_map[i]
                       # Nối thẳng Crop về lại tensor gốc trước Split
                       original_input = split_map.get(crop_info['input'], crop_info['input'])
                       # Chuyển Crop thành Slice tĩnh
@@ -185,7 +194,7 @@ jobs:
                       new_lines.append(new_line)
                       replaced_crops += 1
                   else:
-                      new_lines.append(line)
+                      new_lines.append(lines[i])
 
               with open(output_file, 'w') as f:
                   f.writelines(new_lines)
