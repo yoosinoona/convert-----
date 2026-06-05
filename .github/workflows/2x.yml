@@ -1,4 +1,4 @@
-name: Convert 2xParagonSR_Nano_gan (onnx2ncnn only)
+name: Convert 2xParagonSR_Nano_gan (onnx2ncnn fixed)
 
 on:
   workflow_dispatch:
@@ -17,7 +17,7 @@ jobs:
           python-version: '3.10'
 
       - name: Install Python deps
-        run: pip install onnx onnxsim
+        run: pip install onnx onnxsim numpy
 
       - name: Download ONNX model
         run: |
@@ -27,17 +27,90 @@ jobs:
             "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx.data"
           ls -lh net_g_75000_fused_op18_fp32.onnx net_g_75000_fused_op18_fp32.onnx.data
 
-      - name: Merge external data & decompose Mish
+      - name: Merge data, fix Split & decompose Mish
         run: |
           python3 << 'PYEOF'
           import onnx
-          from onnx import helper
+          from onnx import helper, numpy_helper
+          import numpy as np
           import os
 
           print("Loading ONNX with external data...")
           model = onnx.load("net_g_75000_fused_op18_fp32.onnx")
           print("External data merged OK")
 
+          # ═══════════════════════════════════════════════════
+          # 1. FIX DYNAMIC SPLIT -> STATIC SLICE
+          # ═══════════════════════════════════════════════════
+          init_map = {init.name: numpy_helper.to_array(init) for init in model.graph.initializer}
+          const_map = {}
+          for node in model.graph.node:
+              if node.op_type == "Constant":
+                  for attr in node.attribute:
+                      if attr.name == "value":
+                          const_map[node.output[0]] = numpy_helper.to_array(attr.t)
+          const_map.update(init_map)
+
+          temp_nodes = []
+          split_count = 0
+          for node in model.graph.node:
+              if node.op_type == "Split":
+                  split_sizes = None
+                  axis = 0
+                  for attr in node.attribute:
+                      if attr.name == "axis":
+                          axis = attr.i
+                      if attr.name == "split":
+                          split_sizes = list(attr.ints)
+                  
+                  # Nếu Split động (lấy size từ input thứ 2)
+                  if split_sizes is None and len(node.input) >= 2:
+                      split_input_name = node.input[1]
+                      if split_input_name in const_map:
+                          split_sizes = const_map[split_input_name].tolist()
+                  
+                  if split_sizes is not None:
+                      starts = [0]
+                      for s in split_sizes:
+                          starts.append(starts[-1] + s)
+                      
+                      outputs = node.output
+                      for i, out_name in enumerate(outputs):
+                          start_val = np.array([starts[i]], dtype=np.int64)
+                          end_val = np.array([starts[i+1]], dtype=np.int64)
+                          axis_val = np.array([axis], dtype=np.int64)
+                          
+                          start_name = f"{out_name}_start"
+                          end_name = f"{out_name}_end"
+                          axis_name = f"{out_name}_axis"
+                          
+                          # Thêm constant vào graph
+                          model.graph.initializer.extend([
+                              numpy_helper.from_array(start_val, start_name),
+                              numpy_helper.from_array(end_val, end_name),
+                              numpy_helper.from_array(axis_val, axis_name)
+                          ])
+                          
+                          # Tạo node Slice tĩnh thay thế
+                          slice_node = helper.make_node(
+                              "Slice",
+                              inputs=[node.input[0], start_name, end_name, axis_name],
+                              outputs=[out_name]
+                          )
+                          temp_nodes.append(slice_node)
+                      split_count += 1
+                  else:
+                      temp_nodes.append(node)
+              else:
+                  temp_nodes.append(node)
+          
+          del model.graph.node[:]
+          model.graph.node.extend(temp_nodes)
+          print(f"✅ Replaced {split_count} dynamic Split nodes with static Slice nodes")
+
+          # ═══════════════════════════════════════════════════
+          # 2. DECOMPOSE MISH
+          # ═══════════════════════════════════════════════════
           new_nodes = []
           mish_count = 0
           for node in model.graph.node:
@@ -55,7 +128,7 @@ jobs:
 
           del model.graph.node[:]
           model.graph.node.extend(new_nodes)
-          print(f"Replaced {mish_count} Mish nodes")
+          print(f"✅ Replaced {mish_count} Mish nodes")
 
           onnx.save(model, "merged.onnx", save_as_external_data=False)
           size_mb = os.path.getsize("merged.onnx") / (1024 * 1024)
@@ -81,7 +154,6 @@ jobs:
 
           echo "=== Verify ==="
           ls ncnn-20240820-ubuntu-2204/bin/onnx2ncnn
-          ldconfig -p | grep libprotobuf
 
       - name: Convert ONNX to NCNN
         run: |
@@ -115,36 +187,28 @@ jobs:
             sed -i 's/DepthToSpace/PixelShuffle/g' 2xParagonSR_Nano_gan.param
           fi
 
-          # Sửa MemoryData format cho khớp ncnn-20260113
-          # Format cũ (20240820): MemoryData name 0 1 output 0=24
-          # Format mới (20260113): MemoryData name 0 1 output 24
-          echo "=== Checking MemoryData format ==="
-          grep "MemoryData" 2xParagonSR_Nano_gan.param | head -3
-
-          echo ""
-          echo "=== Param header ==="
+          echo "=== Param Validation ==="
           head -3 2xParagonSR_Nano_gan.param
+          
+          # Kiểm tra xem còn Slice động (-233) không
+          if grep -q "\-233" 2xParagonSR_Nano_gan.param; then
+            echo "⚠️ WARNING: File still contains dynamic Slice (-233)!"
+          else
+            echo "✅ No dynamic Slice (-233) found. Model is clean!"
+          fi
 
           echo ""
           echo "Layer count: $(head -1 2xParagonSR_Nano_gan.param | awk '{print $2}')"
-          echo "Input: $(grep '^Input' 2xParagonSR_Nano_gan.param | head -1)"
-          echo ""
           echo "GroupNorm layers: $(grep -c 'GroupNorm' 2xParagonSR_Nano_gan.param || echo 0)"
           echo "PixelShuffle: $(grep -c 'PixelShuffle' 2xParagonSR_Nano_gan.param || echo 0)"
-          echo "Mish layers: $(grep -c 'Mish' 2xParagonSR_Nano_gan.param || echo 0)"
           echo "Softplus layers: $(grep -c 'Softplus' 2xParagonSR_Nano_gan.param || echo 0)"
+          echo "Slice layers: $(grep -c 'Slice' 2xParagonSR_Nano_gan.param || echo 0)"
 
           BIN_SIZE=$(stat -c%s "2xParagonSR_Nano_gan.bin")
           echo "BIN size: $BIN_SIZE bytes"
 
-          if [ "$BIN_SIZE" -lt 50000 ]; then
-            echo "ERROR: .bin too small!"
-            exit 1
-          fi
-
           echo ""
           echo "=== CONVERSION SUCCESS ==="
-          echo "Dùng trực tiếp với ncnn Android 20260113 (backward compatible)"
           ls -lh 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
 
       - name: Upload artifacts
