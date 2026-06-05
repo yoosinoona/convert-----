@@ -21,18 +21,18 @@ jobs:
 
       - name: Download ONNX model
         run: |
-          wget -q -O net_g.onnx \
-            "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx"
-          wget -q -O net_g.onnx.data \
-            "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx.data"
-          ls -lh net_g.onnx net_g.onnx.data
+          # ★ FIX: Tải về giữ nguyên tên gốc để ONNX tìm thấy file .data
+          wget -q "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx"
+          wget -q "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx.data"
+          ls -lh 2xParagonSR_Nano_gan_op18_fp32.onnx 2xParagonSR_Nano_gan_op18_fp32.onnx.data
 
       - name: Merge external data
         run: |
           python3 << 'PYEOF'
           import onnx
+          # ★ FIX: Load bằng tên gốc
           print("Loading ONNX with external data...")
-          model = onnx.load("net_g.onnx")
+          model = onnx.load("2xParagonSR_Nano_gan_op18_fp32.onnx")
           onnx.save(model, "merged.onnx", save_as_external_data=False)
           print("Merged OK")
           PYEOF
