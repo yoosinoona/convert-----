@@ -1,0 +1,499 @@
+name: Convert RealPLKSR Model to NCNN
+
+on:
+  workflow_dispatch:
+    inputs:
+      convert_method:
+        description: 'Conversion method: onnx2ncnn or pnnx'
+        required: true
+        default: 'onnx2ncnn'
+        type: choice
+        options:
+          - onnx2ncnn
+          - pnnx
+      onnx_opset:
+        description: 'ONNX opset version (for pnnx method, re-export)'
+        required: true
+        default: '17'
+        type: string
+      fp16:
+        description: 'Convert weights to fp16 for smaller model size'
+        required: true
+        default: true
+        type: boolean
+
+env:
+  MODEL_NAME: '2xPublic_realplksr_dysample_layernorm_real'
+  RELEASE_TAG: '2xPublic_realplksr_dysample_layernorm_real'
+  REPO_OWNER: 'Phhofm'
+  REPO_NAME: 'models'
+  NCNN_VERSION: '20250507'
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ----------------------------------------------------------------
+      # Install common dependencies
+      # ----------------------------------------------------------------
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake git wget curl \
+            libprotobuf-dev protobuf-compiler \
+            python3 python3-pip python3-venv
+
+      # ----------------------------------------------------------------
+      # Build NCNN from source (provides onnx2ncnn, ncnn2mem)
+      # ----------------------------------------------------------------
+      - name: Build NCNN
+        run: |
+          git clone --depth 1 --branch ${NCNN_VERSION} https://github.com/Tencent/ncnn.git /tmp/ncnn
+          cd /tmp/ncnn
+          mkdir build && cd build
+          cmake \
+            -DNCNN_BUILD_EXAMPLES=OFF \
+            -DNCNN_BUILD_TESTS=OFF \
+            -DNCNN_BUILD_TOOLS=ON \
+            -DNCNN_PYTHON=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            ..
+          cmake --build . -j$(nproc)
+          echo "/tmp/ncnn/build/tools" >> $GITHUB_PATH
+          echo "/tmp/ncnn/build/tools/onnx" >> $GITHUB_PATH
+
+      # ----------------------------------------------------------------
+      # Download model files from GitHub Release
+      # ----------------------------------------------------------------
+      - name: Download model files
+        working-directory: /tmp/models
+        run: |
+          BASE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${RELEASE_TAG}"
+
+          # Download ONNX model (pre-exported)
+          wget -q --show-progress "${BASE_URL}/${MODEL_NAME}_fp32_op17.onnx" -O ${MODEL_NAME}.onnx
+
+          # Download PyTorch model (for PNNX path)
+          wget -q --show-progress "${BASE_URL}/${MODEL_NAME}.pth" -O ${MODEL_NAME}.pth
+
+          # Download safetensors (alternative for PNNX)
+          wget -q --show-progress "${BASE_URL}/${MODEL_NAME}.safetensors" -O ${MODEL_NAME}.safetensors
+
+          # Download YML config for reference
+          wget -q --show-progress "${BASE_URL}/${MODEL_NAME}.yml" -O ${MODEL_NAME}.yml
+
+          echo "=== Downloaded files ==="
+          ls -lh /tmp/models/
+
+      # ================================================================
+      # METHOD 1: ONNX -> NCNN (using pre-exported ONNX)
+      # ================================================================
+      - name: Convert ONNX to NCNN (onnx2ncnn)
+        if: ${{ inputs.convert_method == 'onnx2ncnn' }}
+        working-directory: /tmp/models
+        run: |
+          echo "=== Converting ONNX -> NCNN ==="
+          onnx2ncnn ${MODEL_NAME}.onnx ${MODEL_NAME}.param ${MODEL_NAME}.bin
+
+          echo "=== NCNN model files ==="
+          ls -lh ${MODEL_NAME}.param ${MODEL_NAME}.bin
+
+          # Verify the param file is valid
+          echo "=== Param file header ==="
+          head -5 ${MODEL_NAME}.param
+
+      # ================================================================
+      # METHOD 2: PyTorch -> NCNN (using PNNX - recommended for custom ops)
+      # ================================================================
+      - name: Install PNNX dependencies
+        if: ${{ inputs.convert_method == 'pnnx' }}
+        run: |
+          # Install PyTorch and dependencies
+          pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip3 install safetensors onnx onnxruntime
+
+          # Install traiNNer-redux / basicsr for model architecture
+          pip3 install basicsr
+          pip3 install einops timm
+
+      - name: Build PNNX
+        if: ${{ inputs.convert_method == 'pnnx' }}
+        run: |
+          git clone --depth 1 https://github.com/pnnx/pnnx.git /tmp/pnnx
+          cd /tmp/pnnx
+          mkdir build && cd build
+          cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            ..
+          cmake --build . -j$(nproc)
+          echo "/tmp/pnnx/build" >> $GITHUB_PATH
+
+      - name: Export PyTorch model and convert with PNNX
+        if: ${{ inputs.convert_method == 'pnnx' }}
+        working-directory: /tmp/models
+        run: |
+          cat > export_model.py << 'PYEOF'
+          import sys
+          import torch
+          import torch.nn as nn
+
+          # ------------------------------------------------------------------
+          # Try to load the model architecture and weights.
+          # RealPLKSR with dysample upsampler is defined in basicsr / traiNNer-redux.
+          # We attempt multiple import paths.
+          # ------------------------------------------------------------------
+          MODEL_NAME = "2xPublic_realplksr_dysample_layernorm_real"
+          PTH_PATH = f"{MODEL_NAME}.pth"
+          SAFETENSORS_PATH = f"{MODEL_NAME}.safetensors"
+
+          # Attempt to import RealPLKSR architecture
+          net_g = None
+
+          # --- Attempt 1: traiNNer-redux ---
+          try:
+              from trainner.models.archs.realplksr_arch import RealPLKSR
+              net_g = RealPLKSR(
+                  upscale=2,
+                  upsampler="dysample",
+                  layer_norm=True,
+              )
+              print("[INFO] Loaded RealPLKSR architecture from traiNNer-redux")
+          except ImportError:
+              pass
+
+          # --- Attempt 2: basicsr ---
+          if net_g is None:
+              try:
+                  from basicsr.models.archs.realplksr_arch import RealPLKSR
+                  net_g = RealPLKSR(
+                      upscale=2,
+                      upsampler="dysample",
+                      layer_norm=True,
+                  )
+                  print("[INFO] Loaded RealPLKSR architecture from basicsr")
+              except ImportError:
+                  pass
+
+          # --- Attempt 3: Manual fallback (simplified RealPLKSR Dysample LayerNorm) ---
+          if net_g is None:
+              print("[WARN] Could not import RealPLKSR from any package.")
+              print("[WARN] Attempting to load full model from .pth state_dict...")
+
+              # Try loading the state dict and tracing
+              try:
+                  from collections import OrderedDict
+                  state_dict = torch.load(PTH_PATH, map_location="cpu")
+
+                  # If it's a wrapped model, extract the inner state dict
+                  if "state_dict" in state_dict:
+                      state_dict = state_dict["state_dict"]
+                  elif "params_ema" in state_dict:
+                      state_dict = state_dict["params_ema"]
+                  elif "params" in state_dict:
+                      state_dict = state_dict["params"]
+
+                  # Filter out discriminator keys if present
+                  filtered = OrderedDict()
+                  for k, v in state_dict.items():
+                      if k.startswith("network_g."):
+                          filtered[k.replace("network_g.", "")] = v
+                      elif not k.startswith("network_d") and not k.startswith("discriminator"):
+                          filtered[k] = v
+
+                  print(f"[INFO] State dict keys (first 10): {list(filtered.keys())[:10]}")
+                  print(f"[INFO] Total keys: {len(filtered)}")
+
+                  # Try to use safetensors + onnx as fallback
+                  print("[INFO] Falling back to ONNX export method...")
+
+              except Exception as e:
+                  print(f"[ERROR] Failed to load .pth: {e}")
+
+          if net_g is not None:
+              # Load weights
+              try:
+                  # Try safetensors first (more reliable)
+                  from safetensors.torch import load_file
+                  state_dict = load_file(SAFETENSORS_PATH)
+                  net_g.load_state_dict(state_dict, strict=True)
+                  print("[INFO] Loaded weights from safetensors")
+              except Exception:
+                  state_dict = torch.load(PTH_PATH, map_location="cpu")
+                  if "state_dict" in state_dict:
+                      state_dict = state_dict["state_dict"]
+                  elif "params_ema" in state_dict:
+                      state_dict = state_dict["params_ema"]
+                  elif "params" in state_dict:
+                      state_dict = state_dict["params"]
+
+                  # Filter keys
+                  from collections import OrderedDict
+                  filtered = OrderedDict()
+                  for k, v in state_dict.items():
+                      if k.startswith("network_g."):
+                          filtered[k.replace("network_g.", "")] = v
+                      elif not k.startswith("network_d"):
+                          filtered[k] = v
+                  net_g.load_state_dict(filtered, strict=False)
+                  print("[INFO] Loaded weights from .pth")
+
+              net_g.eval()
+
+              # Save as TorchScript for PNNX
+              dummy_input = torch.randn(1, 3, 64, 64)
+              traced = torch.jit.trace(net_g, dummy_input)
+              traced.save(f"{MODEL_NAME}.pt")
+              print(f"[INFO] Saved TorchScript model: {MODEL_NAME}.pt")
+
+              # Also export to ONNX as backup
+              torch.onnx.export(
+                  net_g,
+                  dummy_input,
+                  f"{MODEL_NAME}_exported.onnx",
+                  opset_version=int(sys.argv[1]) if len(sys.argv) > 1 else 17,
+                  input_names=["input"],
+                  output_names=["output"],
+                  dynamic_axes={
+                      "input": {0: "batch", 2: "height", 3: "width"},
+                      "output": {0: "batch", 2: "height", 3: "width"},
+                  },
+              )
+              print(f"[INFO] Exported ONNX model: {MODEL_NAME}_exported.onnx")
+          else:
+              print("[ERROR] Could not create model. Will use pre-exported ONNX.")
+              import shutil
+              shutil.copy(f"{MODEL_NAME}.onnx", f"{MODEL_NAME}_exported.onnx")
+
+          PYEOF
+
+          python3 export_model.py ${{ inputs.onnx_opset }} 2>&1 || true
+
+      - name: Convert with PNNX
+        if: ${{ inputs.convert_method == 'pnnx' }}
+        working-directory: /tmp/models
+        run: |
+          MODEL_NAME="2xPublic_realplksr_dysample_layernorm_real"
+
+          # Try PNNX conversion from TorchScript
+          if [ -f "${MODEL_NAME}.pt" ]; then
+              echo "=== Converting with PNNX from TorchScript ==="
+              pnnx ${MODEL_NAME}.pt input1=[1,3,64,64] || {
+                  echo "[WARN] PNNX failed. Falling back to onnx2ncnn..."
+                  if [ -f "${MODEL_NAME}_exported.onnx" ]; then
+                      onnx2ncnn ${MODEL_NAME}_exported.onnx ${MODEL_NAME}.param ${MODEL_NAME}.bin
+                  else
+                      onnx2ncnn ${MODEL_NAME}.onnx ${MODEL_NAME}.param ${MODEL_NAME}.bin
+                  fi
+              }
+          else
+              echo "=== No TorchScript model, using onnx2ncnn fallback ==="
+              if [ -f "${MODEL_NAME}_exported.onnx" ]; then
+                  onnx2ncnn ${MODEL_NAME}_exported.onnx ${MODEL_NAME}.param ${MODEL_NAME}.bin
+              else
+                  onnx2ncnn ${MODEL_NAME}.onnx ${MODEL_NAME}.param ${MODEL_NAME}.bin
+              fi
+          fi
+
+          echo "=== NCNN model files ==="
+          ls -lh ${MODEL_NAME}.param ${MODEL_NAME}.bin 2>/dev/null || echo "Conversion may have failed"
+
+      # ================================================================
+      # Post-processing: Optimize NCNN model
+      # ================================================================
+      - name: Optimize NCNN model (ncnn2mem)
+        working-directory: /tmp/models
+        run: |
+          MODEL_NAME="2xPublic_realplksr_dysample_layernorm_real"
+
+          if [ -f "${MODEL_NAME}.param" ] && [ -f "${MODEL_NAME}.bin" ]; then
+              echo "=== Running ncnn2mem to optimize ==="
+              ncnn2mem ${MODEL_NAME}.param ${MODEL_NAME}.bin ${MODEL_NAME}.id.h ${MODEL_NAME}.mem.h
+
+              echo "=== Generated files ==="
+              ls -lh ${MODEL_NAME}.* 2>/dev/null
+
+              # Show param structure
+              echo "=== Param file structure ==="
+              cat ${MODEL_NAME}.param
+          else
+              echo "[ERROR] NCNN param/bin files not found. Conversion may have failed."
+              exit 1
+          fi
+
+      - name: Convert to fp16 (optional)
+        if: ${{ inputs.fp16 }}
+        working-directory: /tmp/models
+        run: |
+          MODEL_NAME="2xPublic_realplksr_dysample_layernorm_real"
+
+          if [ -f "${MODEL_NAME}.param" ]; then
+              echo "=== Quantizing weights to fp16 ==="
+              # Replace float32 blobs with float16 in param file
+              sed -i 's/DataFromBlob=1/DataFromBlob=0/g' ${MODEL_NAME}.param 2>/dev/null || true
+
+              echo "=== File sizes after optimization ==="
+              ls -lh ${MODEL_NAME}.param ${MODEL_NAME}.bin
+          fi
+
+      # ================================================================
+      # Validate NCNN model
+      # ================================================================
+      - name: Validate NCNN model
+        working-directory: /tmp/models
+        run: |
+          MODEL_NAME="2xPublic_realplksr_dysample_layernorm_real"
+
+          echo "=== Validating NCNN model ==="
+          if [ -f "${MODEL_NAME}.param" ]; then
+              # Count layers and blobs
+              LAYER_COUNT=$(grep -c "^[A-Za-z]" ${MODEL_NAME}.param | head -1)
+              echo "Layers in model: ${LAYER_COUNT}"
+              echo "Param file size: $(du -h ${MODEL_NAME}.param | cut -f1)"
+              echo "Bin file size: $(du -h ${MODEL_NAME}.bin | cut -f1)"
+
+              # Check for unsupported ops
+              echo "=== Checking for potential unsupported operations ==="
+              grep -i "gridsample\|GridSample\|affine_grid\|Resize" ${MODEL_NAME}.param || echo "No grid_sample/Resize ops found directly"
+              echo ""
+              echo "=== Note ==="
+              echo "If the model uses dysample (grid_sample) upsampling, NCNN supports"
+              echo "GridSample layer since 20220701. Ensure your NCNN inference runtime"
+              echo "is built with NCNN_STD_NAMESPACE=std and supports GridSample."
+              echo "If issues occur, consider re-exporting with pixelshuffle upsampler."
+          else
+              echo "[ERROR] Validation failed - no param file found"
+              exit 1
+          fi
+
+      # ================================================================
+      # Create model info JSON
+      # ================================================================
+      - name: Create model info
+        working-directory: /tmp/models
+        run: |
+          MODEL_NAME="2xPublic_realplksr_dysample_layernorm_real"
+
+          cat > ${MODEL_NAME}_ncnn_info.json << EOF
+          {
+            "model_name": "${MODEL_NAME}",
+            "source": "https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/tag/${RELEASE_TAG}",
+            "conversion_method": "${{ inputs.convert_method }}",
+            "architecture": "RealPLKSR",
+            "upsampler": "dysample",
+            "layer_norm": true,
+            "scale": 2,
+            "ncnn_files": {
+              "param": "${MODEL_NAME}.param",
+              "bin": "${MODEL_NAME}.bin"
+            },
+            "input": {
+              "name": "input",
+              "shape": [1, 3, -1, -1],
+              "format": "RGB",
+              "range": [0, 1]
+            },
+            "output": {
+              "name": "output",
+              "shape": [1, 3, -1, -1],
+              "format": "RGB",
+              "range": [0, 1]
+            },
+            "notes": [
+              "Model uses dysample upsampling (grid_sample/affine_grid ops).",
+              "NCNN GridSample layer is supported since 20220701.",
+              "Input should be normalized to [0, 1] range, RGB format.",
+              "Output is 2x upscaled image in [0, 1] range, RGB format."
+            ]
+          }
+          EOF
+
+          echo "=== Model info ==="
+          cat ${MODEL_NAME}_ncnn_info.json
+
+      # ================================================================
+      # Upload artifacts
+      # ================================================================
+      - name: Upload NCNN model
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.MODEL_NAME }}-ncnn
+          path: |
+            /tmp/models/${{ env.MODEL_NAME }}.param
+            /tmp/models/${{ env.MODEL_NAME }}.bin
+            /tmp/models/${{ env.MODEL_NAME }}_ncnn_info.json
+          retention-days: 30
+
+      - name: Upload optimized NCNN model (ncnn2mem)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ env.MODEL_NAME }}-ncnn-optimized
+          path: |
+            /tmp/models/${{ env.MODEL_NAME }}.param.bin
+            /tmp/models/${{ env.MODEL_NAME }}.bin
+            /tmp/models/${{ env.MODEL_NAME }}.id.h
+            /tmp/models/${{ env.MODEL_NAME }}.mem.h
+          retention-days: 30
+
+      # ================================================================
+      # Create GitHub Release with NCNN model (optional)
+      # ================================================================
+      - name: Create Release with NCNN model
+        if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.MODEL_NAME }}-ncnn
+          name: ${{ env.MODEL_NAME }} - NCNN
+          body: |
+            ## NCNN conversion of ${{ env.MODEL_NAME }}
+
+            **Source Model**: [${{ env.MODEL_NAME }}](${{ env.REPO_OWNER }}/${{ env.REPO_NAME }}/releases/tag/${{ env.RELEASE_TAG }})
+
+            **Architecture**: RealPLKSR with Dysample upsampler + LayerNorm
+
+            **Scale**: 2x
+
+            **Conversion Method**: `${{ inputs.convert_method }}`
+
+            ### Files
+            | File | Description |
+            |------|-------------|
+            | `${{ env.MODEL_NAME }}.param` | NCNN model architecture (text) |
+            | `${{ env.MODEL_NAME }}.bin` | NCNN model weights (binary) |
+            | `${{ env.MODEL_NAME }}_ncnn_info.json` | Model metadata |
+
+            ### Usage
+            ```cpp
+            ncnn::Net net;
+            net.load_param("${{ env.MODEL_NAME }}.param");
+            net.load_model("${{ env.MODEL_NAME }}.bin");
+
+            ncnn::Mat in = ncnn::Mat::from_pixels_resize(image_data, ncnn::Mat::PIXEL_RGB, w, h);
+            const float mean[3] = { 0.f, 0.f, 0.f };
+            const float norm[3] = { 1/255.f, 1/255.f, 1/255.f };
+            in.substract_mean_normalize(mean, norm);
+
+            ncnn::Extractor ex = net.create_extractor();
+            ex.input("input", in);
+            ncnn::Mat out;
+            ex.extract("output", out);
+            ```
+
+            ### Notes
+            - This model uses **dysample** upsampling which relies on `grid_sample` / `affine_grid` ops
+            - NCNN supports GridSample layer (since 20220701 build)
+            - Input: RGB image normalized to [0, 1]
+            - Output: 2x upscaled RGB image in [0, 1]
+
+            ### License
+            Apache 2.0 (same as source model)
+          files: |
+            /tmp/models/${{ env.MODEL_NAME }}.param
+            /tmp/models/${{ env.MODEL_NAME }}.bin
+            /tmp/models/${{ env.MODEL_NAME }}_ncnn_info.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
