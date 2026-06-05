@@ -1,4 +1,4 @@
-name: Convert 2xParagonSR_Nano_gan (PNNX)
+name: Convert 2xParagonSR_Nano_gan (Ultimate Robust Fix)
 
 on:
   workflow_dispatch:
@@ -28,12 +28,11 @@ jobs:
       - name: Merge external data
         run: |
           python3 << 'PYEOF'
-          import onnx
-          import os
-          print("Loading ONNX with external data...")
+          import onnx, os
+          print("Loading ONNX...")
           model = onnx.load("2xParagonSR_Nano_gan_op18_fp32.onnx", load_external_data=True)
           onnx.save(model, "merged.onnx", save_as_external_data=False)
-          print(f"Merged OK! Size: {os.path.getsize('merged.onnx') / (1024*1024):.1f} MB")
+          print(f"Merged OK! Size: {os.path.getsize('merged.onnx')/(1024*1024):.1f} MB")
           PYEOF
 
       - name: Simplify ONNX
@@ -51,8 +50,7 @@ jobs:
 
       - name: Convert ONNX to NCNN
         run: |
-          ONNX2NCNN=./ncnn-20240820-ubuntu-2204/bin/onnx2ncnn
-          $ONNX2NCNN model_final.onnx raw.param raw.bin 2>&1
+          ./ncnn-20240820-ubuntu-2204/bin/onnx2ncnn model_final.onnx raw.param raw.bin 2>&1
           if [ ! -f "raw.param" ] || [ ! -f "raw.bin" ]; then echo "ERROR: onnx2ncnn failed!"; exit 1; fi
           echo "=== onnx2ncnn OK ==="
 
@@ -61,127 +59,12 @@ jobs:
           python3 << 'PYEOF'
           import re
 
-          def fix_ncnn_param(input_file, output_file):
+          def ultimate_fix(input_file, output_file):
               with open(input_file, 'r') as f:
                   lines = f.readlines()
               
-              # 1. Xây dựng bản đồ blob: output -> input của các node Split
+              # 1. Map origins of Split nodes (e.g., group_norm_splitncnn_3 -> group_norm)
               split_map = {}
               for line in lines:
                   parts = line.strip().split()
-                  if len(parts) > 5 and parts[0] == 'Split':
-                      num_inputs = int(parts[2])
-                      num_outputs = int(parts[3])
-                      input_blobs = parts[4:4+num_inputs]
-                      output_blobs = parts[4+num_inputs:4+num_inputs+num_outputs]
-                      if input_blobs:
-                          for ob in output_blobs:
-                              split_map[ob] = input_blobs[0]
-
-              # 2. Tìm và loại bỏ các node rác val_24
-              val_24_blobs = set(["val_24"])
-              for line in lines:
-                  parts = line.strip().split()
-                  if len(parts) > 5 and parts[0] == 'Split':
-                      num_inputs = int(parts[2])
-                      input_blobs = parts[4:4+num_inputs]
-                      if "val_24" in input_blobs:
-                          num_outputs = int(parts[3])
-                          output_blobs = parts[4+num_inputs:4+num_inputs+num_outputs]
-                          for ob in output_blobs:
-                              val_24_blobs.add(ob)
-
-              new_lines = []
-              splits_definition = [(0, 15), (15, 18), (18, 21), (21, 24)]
-              
-              for line in lines:
-                  parts = line.strip().split()
-                  if not parts: continue
-                  
-                  # Bỏ qua dòng có chứa blob rác val_24
-                  if any(blob in val_24_blobs for blob in parts):
-                      continue
-                      
-                  # Sửa Slice động (-23300=4,-233,...)
-                  if len(parts) > 5 and parts[0] == 'Slice' and '-23300=4,-233' in line:
-                      node_name = parts[1]
-                      num_inputs = int(parts[2])
-                      num_outputs = int(parts[3])
-                      data_blob = parts[4]
-                      output_blobs = parts[4+num_inputs : 4+num_inputs+num_outputs]
-                      
-                      for i, out_blob in enumerate(output_blobs):
-                          start, end = splits_definition[i]
-                          static_slice_line = f"Slice            {node_name}_{i} 1 1 {data_blob} {out_blob} -23300=1,{start} -23301=1,{end} -23302=1,0\n"
-                          new_lines.append(static_slice_line)
-                      continue
-                      
-                  # Sửa Crop động (-23309=1,... -23310=1,...)
-                  if len(parts) > 5 and parts[0] == 'Crop' and '-23309=1,' in line:
-                      node_name = parts[1]
-                      num_inputs = int(parts[2])
-                      num_outputs = int(parts[3])
-                      input_blobs = parts[4:4+num_inputs]
-                      output_blobs = parts[4+num_inputs:4+num_inputs+num_outputs]
-                      
-                      # Truy ngược tensor gốc (ví dụ group_norm_splitncnn_3 -> group_norm)
-                      data_blob = input_blobs[0]
-                      if data_blob in split_map:
-                          data_blob = split_map[data_blob]
-                          
-                      # Rút trích start và end từ tham số -23309 và -23310
-                      start_match = re.search(r'-23309=1,(\d+)', line)
-                      end_match = re.search(r'-23310=1,(\d+)', line)
-                      
-                      if start_match and end_match:
-                          start = start_match.group(1)
-                          end = end_match.group(1)
-                          out_blob = output_blobs[0]
-                          static_slice_line = f"Slice            {node_name} 1 1 {data_blob} {out_blob} -23300=1,{start} -23301=1,{end} -23302=1,0\n"
-                          new_lines.append(static_slice_line)
-                          continue
-                          
-                  new_lines.append(line)
-                  
-              # Cập nhật Header (đếm lại số layer chính xác)
-              magic = new_lines[0].strip()
-              blob_count = new_lines[1].strip().split()[1]
-              actual_layers = len(new_lines) - 2
-              new_lines[1] = f"{actual_layers} {blob_count}\n"
-              
-              with open(output_file, 'w') as f:
-                  f.writelines(new_lines)
-              
-              print(f"✅ Ultimate Auto-Fix Applied! Layer count updated to {actual_layers}")
-
-          fix_ncnn_param('raw.param', '2xParagonSR_Nano_gan.param')
-          PYEOF
-
-      - name: Final validation
-        run: |
-          cp raw.bin 2xParagonSR_Nano_gan.bin
-
-          if grep -q "DepthToSpace" 2xParagonSR_Nano_gan.param; then
-            sed -i 's/DepthToSpace/PixelShuffle/g' 2xParagonSR_Nano_gan.param
-          fi
-
-          echo "=== Final Param Validation ==="
-          head -3 2xParagonSR_Nano_gan.param
-          
-          if grep -q "\-23300=4,\-233" 2xParagonSR_Nano_gan.param || grep -q "Crop.*\-23309" 2xParagonSR_Nano_gan.param || grep -q "val_24" 2xParagonSR_Nano_gan.param; then
-            echo "⚠️ WARNING: File still contains dynamic patterns or orphans!"
-          else
-            echo "✅ Model is completely clean!"
-          fi
-
-          echo "=== CONVERSION SUCCESS ==="
-          ls -lh 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: 2xParagonSR_Nano_gan_ncnn_definitive
-          path: |
-            2xParagonSR_Nano_gan.param
-            2xParagonSR_Nano_gan.bin
-          retention-days: 90
+                  if len(parts) > 5 and parts[0]
