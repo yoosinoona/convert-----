@@ -1,4 +1,4 @@
-name: Convert 2xParagonSR_Nano_gan (Fixed Auto Pipeline)
+name: Convert 2xParagonSR_Nano_gan (Auto-Fix Param)
 
 on:
   workflow_dispatch:
@@ -69,95 +69,6 @@ jobs:
             || cp merged.onnx model_simplified.onnx
           ls -lh model_simplified.onnx
 
-      - name: Fix Dynamic Split -> Static Slice (AFTER onnxsim)
-        run: |
-          python3 << 'PYEOF'
-          import onnx
-          from onnx import helper, numpy_helper
-          import numpy as np
-          import os
-
-          print("Loading simplified ONNX model...")
-          model = onnx.load("model_simplified.onnx")
-
-          # Map tất cả constant và initializer để tìm kích thước split
-          const_map = {}
-          for init in model.graph.initializer:
-              const_map[init.name] = numpy_helper.to_array(init)
-          for node in model.graph.node:
-              if node.op_type == "Constant":
-                  for attr in node.attribute:
-                      if attr.name == "value":
-                          const_map[node.output[0]] = numpy_helper.to_array(attr.t)
-
-          new_nodes = []
-          split_count = 0
-          for node in model.graph.node:
-              if node.op_type == "Split":
-                  split_sizes = None
-                  axis = 0
-                  
-                  # 1. Tìm axis và split sizes từ attribute (opset cũ)
-                  for attr in node.attribute:
-                      if attr.name == "axis":
-                          axis = attr.i
-                      if attr.name == "split":
-                          split_sizes = list(attr.ints)
-                  
-                  # 2. Tìm từ inputs (opset 13+)
-                  if split_sizes is None and len(node.input) >= 2 and node.input[1] != '':
-                      size_input_name = node.input[1]
-                      if size_input_name in const_map:
-                          split_sizes = const_map[size_input_name].tolist()
-                          
-                  if len(node.input) >= 3 and node.input[2] != '':
-                      axis_input_name = node.input[2]
-                      if axis_input_name in const_map:
-                          axis = int(const_map[axis_input_name])
-
-                  # Nếu tìm được kích thước tĩnh, thay thế bằng Slice
-                  if split_sizes is not None:
-                      starts = [0]
-                      for s in split_sizes:
-                          starts.append(starts[-1] + s)
-                      
-                      for i, out_name in enumerate(node.output):
-                          start_val = np.array([starts[i]], dtype=np.int64)
-                          end_val = np.array([starts[i+1]], dtype=np.int64)
-                          axis_val = np.array([axis], dtype=np.int64)
-                          
-                          start_name = f"{out_name}_start"
-                          end_name = f"{out_name}_end"
-                          axis_name = f"{out_name}_axis"
-                          
-                          model.graph.initializer.extend([
-                              numpy_helper.from_array(start_val, start_name),
-                              numpy_helper.from_array(end_val, end_name),
-                              numpy_helper.from_array(axis_val, axis_name)
-                          ])
-                          
-                          # Node Slice đọc trực tiếp từ input gốc, bỏ qua node Split
-                          slice_node = helper.make_node(
-                              "Slice",
-                              inputs=[node.input[0], start_name, end_name, axis_name],
-                              outputs=[out_name]
-                          )
-                          new_nodes.append(slice_node)
-                      split_count += 1
-                  else:
-                      new_nodes.append(node)
-              else:
-                  new_nodes.append(node)
-
-          del model.graph.node[:]
-          model.graph.node.extend(new_nodes)
-          print(f"✅ Replaced {split_count} dynamic Split nodes with static Slice nodes")
-
-          onnx.save(model, "model_final.onnx", save_as_external_data=False)
-          size_mb = os.path.getsize("model_final.onnx") / (1024 * 1024)
-          print(f"Saved model_final.onnx ({size_mb:.1f} MB)")
-          PYEOF
-
       - name: Download ncnn tools (20240820) & install deps
         run: |
           wget -q "https://github.com/Tencent/ncnn/releases/download/20240820/ncnn-20240820-ubuntu-2204.zip"
@@ -170,25 +81,123 @@ jobs:
       - name: Convert ONNX to NCNN
         run: |
           ONNX2NCNN=./ncnn-20240820-ubuntu-2204/bin/onnx2ncnn
-          $ONNX2NCNN model_final.onnx raw.param raw.bin 2>&1
+          $ONNX2NCNN model_simplified.onnx raw.param raw.bin 2>&1
 
           if [ ! -f "raw.param" ] || [ ! -f "raw.bin" ]; then
             echo "ERROR: onnx2ncnn failed!"
             exit 1
           fi
-
-          BIN_SIZE=$(stat -c%s "raw.bin")
-          if [ "$BIN_SIZE" -lt 50000 ]; then
-            echo "ERROR: .bin too small!"
-            exit 1
-          fi
           echo "=== onnx2ncnn OK ==="
           ls -lh raw.param raw.bin
 
-      - name: Post-process & validate
+      - name: Auto-Fix NCNN Param (Split+Crop -> Slice)
         run: |
-          cp raw.param 2xParagonSR_Nano_gan.param
-          cp raw.bin    2xParagonSR_Nano_gan.bin
+          python3 << 'PYEOF'
+          import re
+
+          def fix_ncnn_param(input_file, output_file):
+              with open(input_file, 'r') as f:
+                  lines = f.readlines()
+
+              header = lines[0].strip().split()
+              magic = header[0]
+              layer_count = int(header[1])
+              blob_count = header[2]
+
+              # Tìm tất cả node Split và Crop
+              split_map = {}   # output_blob -> input_blob
+              split_lines = {} # line_index -> line_content
+              crop_lines = {}  # line_index -> info_dict
+
+              for i, line in enumerate(lines):
+                  parts = line.strip().split()
+                  if len(parts) < 2: continue
+                  
+                  op_type = parts[0]
+                  
+                  if op_type == 'Split':
+                      num_outputs = int(parts[3])
+                      input_blob = parts[4]
+                      output_blobs = parts[5:5+num_outputs]
+                      for ob in output_blobs:
+                          split_map[ob] = input_blob
+                      split_lines[i] = line
+                      
+                  elif op_type == 'Crop':
+                      # Tìm pattern động: -23309=1,X -23310=1,Y -23311=1,0
+                      match = re.search(r'-23309=1,(\d+)\s+-23310=1,(\d+)\s+-23311=1,0', line)
+                      if match:
+                          node_name = parts[1]
+                          input_blob = parts[4]
+                          output_blob = parts[5]
+                          start_ch = match.group(1)
+                          end_ch = match.group(2)
+                          crop_lines[i] = {
+                              'name': node_name,
+                              'input': input_blob,
+                              'output': output_blob,
+                              'start': start_ch,
+                              'end': end_ch
+                          }
+
+              # Xác định các node Split cần xóa (chỉ khi tất cả output của nó đều đi vào Crop lỗi)
+              lines_to_remove = set()
+              removed_splits = 0
+              
+              for idx, line in split_lines.items():
+                  parts = line.strip().split()
+                  num_outputs = int(parts[3])
+                  output_blobs = parts[5:5+num_outputs]
+                  
+                  can_remove = True
+                  for ob in output_blobs:
+                      # Kiểm tra xem output này có được dùng bởi Crop lỗi không
+                      is_used_by_our_crop = False
+                      for crop_info in crop_lines.values():
+                          if crop_info['input'] == ob:
+                              is_used_by_our_crop = True
+                              break
+                      if not is_used_by_our_crop:
+                          can_remove = False
+                          break
+                  
+                  if can_remove:
+                      lines_to_remove.add(idx)
+                      removed_splits += 1
+
+              # Ghi file mới
+              new_layer_count = layer_count - removed_splits
+              new_lines = [f"{magic} {new_layer_count} {blob_count}\n"]
+              
+              replaced_crops = 0
+              for i, line in enumerate(lines):
+                  if i == 0: continue # Bỏ header cũ
+                  
+                  if i in lines_to_remove:
+                      continue # Xóa node Split
+                      
+                  if i in crop_lines:
+                      crop_info = crop_lines[i]
+                      # Nối thẳng Crop về lại tensor gốc trước Split
+                      original_input = split_map.get(crop_info['input'], crop_info['input'])
+                      # Chuyển Crop thành Slice tĩnh
+                      new_line = f"Slice            {crop_info['name']} 1 1 {original_input} {crop_info['output']} -23300=1,{crop_info['start']} -23301=1,{crop_info['end']} -23302=1,0\n"
+                      new_lines.append(new_line)
+                      replaced_crops += 1
+                  else:
+                      new_lines.append(line)
+
+              with open(output_file, 'w') as f:
+                  f.writelines(new_lines)
+                  
+              print(f"✅ Auto-Fixed Param: Removed {removed_splits} Split nodes, replaced {replaced_crops} Crop nodes with Slice nodes.")
+
+          fix_ncnn_param('raw.param', '2xParagonSR_Nano_gan.param')
+          PYEOF
+
+      - name: Post-process & final check
+        run: |
+          cp raw.bin 2xParagonSR_Nano_gan.bin
 
           # DepthToSpace → PixelShuffle
           if grep -q "DepthToSpace" 2xParagonSR_Nano_gan.param; then
@@ -196,18 +205,24 @@ jobs:
             sed -i 's/DepthToSpace/PixelShuffle/g' 2xParagonSR_Nano_gan.param
           fi
 
-          echo "=== Param Validation ==="
+          echo "=== Final Param Validation ==="
           head -3 2xParagonSR_Nano_gan.param
           
-          # Kiểm tra xem còn Slice động (-233) hoặc Crop lỗi không
-          if grep -q "\-23300=4,\-233" 2xParagonSR_Nano_gan.param || grep -q "Crop.*\-23309=1,0.*\-23310=1,15" 2xParagonSR_Nano_gan.param; then
-            echo "⚠️ WARNING: File still contains dynamic patterns!"
+          # Đảm bảo không còn Crop lỗi
+          if grep -q "Crop.*\-23309" 2xParagonSR_Nano_gan.param; then
+            echo "⚠️ WARNING: File still contains dynamic Crop!"
           else
-            echo "✅ Model param is clean!"
+            echo "✅ Model is completely clean from dynamic Crop/Split!"
           fi
 
           echo "Slice layers: $(grep -c 'Slice' 2xParagonSR_Nano_gan.param || echo 0)"
           echo "Crop layers: $(grep -c 'Crop' 2xParagonSR_Nano_gan.param || echo 0)"
+
+          BIN_SIZE=$(stat -c%s "2xParagonSR_Nano_gan.bin")
+          if [ "$BIN_SIZE" -lt 50000 ]; then
+            echo "ERROR: .bin too small!"
+            exit 1
+          fi
 
           echo ""
           echo "=== CONVERSION SUCCESS ==="
@@ -216,7 +231,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: 2xParagonSR_Nano_gan_ncnn_auto_fixed
+          name: 2xParagonSR_Nano_gan_ncnn_autofixed
           path: |
             2xParagonSR_Nano_gan.param
             2xParagonSR_Nano_gan.bin
