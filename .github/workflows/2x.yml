@@ -250,4 +250,4 @@ jobs:
           path: |
             2xParagonSR_Nano_gan.param
             2xParagonSR_Nano_gan.bin
-          retention-days: 90
+          retention-days: 1
