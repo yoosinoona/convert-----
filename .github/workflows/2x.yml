@@ -65,7 +65,7 @@ jobs:
       - name: Simplify ONNX
         run: |
           python -m onnxsim merged.onnx model_simplified.onnx \
-            --input-shape "input:1,3,256,256" 2>&1 \
+            --input-shape "input:1,3,512,512" 2>&1 \
             || cp merged.onnx model_simplified.onnx
           ls -lh model_simplified.onnx
 
