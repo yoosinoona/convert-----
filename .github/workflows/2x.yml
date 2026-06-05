@@ -90,116 +90,58 @@ jobs:
           echo "=== onnx2ncnn OK ==="
           ls -lh raw.param raw.bin
 
-      - name: Auto-Fix NCNN Param (Split+Crop -> Slice)
+      - name: Auto-Fix NCNN Param (Dynamic Slice -> Static Slice)
         run: |
           python3 << 'PYEOF'
-          import re
-
           def fix_ncnn_param(input_file, output_file):
               with open(input_file, 'r') as f:
                   lines = f.readlines()
 
-              # Đúng format NCNN: Dòng 1 là magic, Dòng 2 là layer_count blob_count
               magic = lines[0].strip()
               counts = lines[1].strip().split()
               layer_count = int(counts[0])
-              blob_count = counts[1]
+              blob_count = int(counts[1])
 
-              split_map = {}   # output_blob -> input_blob
-              split_indices = set()
-              crop_info_map = {} # line_index -> info_dict
+              new_lines = [lines[0], lines[1]]
+              removed_dynamic_slices = 0
+              added_static_slices = 0
 
-              # Duyệt từ dòng thứ 3 (index 2) trở đi
-              for i in range(2, len(lines)):
-                  line = lines[i]
+              # Tỉ lệ cắt channel của model này luôn là 15, 3, 3, 3 (tổng 24)
+              splits = [(0, 15), (15, 18), (18, 21), (21, 24)]
+
+              for line in lines[2:]:
                   parts = line.strip().split()
-                  if len(parts) < 5: continue
                   
-                  op_type = parts[0]
-                  
-                  if op_type == 'Split':
+                  # Tìm node Slice động có chứa tham số -23300=4,-233,-233,-233,-233
+                  if len(parts) > 5 and parts[0] == 'Slice' and '-23300=4,-233,-233,-233,-233' in parts:
+                      node_name = parts[1]
                       num_inputs = int(parts[2])
                       num_outputs = int(parts[3])
                       input_blobs = parts[4:4+num_inputs]
                       output_blobs = parts[4+num_inputs:4+num_inputs+num_outputs]
-                      
-                      input_blob = input_blobs[0] if input_blobs else None
-                      if input_blob:
-                          for ob in output_blobs:
-                              split_map[ob] = input_blob
-                      split_indices.add(i)
-                      
-                  elif op_type == 'Crop':
-                      match = re.search(r'-23309=1,(\d+)\s+-23310=1,(\d+)\s+-23311=1,0', line)
-                      if match:
-                          num_inputs = int(parts[2])
-                          num_outputs = int(parts[3])
-                          input_blobs = parts[4:4+num_inputs]
-                          output_blobs = parts[4+num_inputs:4+num_inputs+num_outputs]
-                          
-                          node_name = parts[1]
-                          input_blob = input_blobs[0] if input_blobs else None
-                          output_blob = output_blobs[0] if output_blobs else None
-                          
-                          if input_blob and output_blob:
-                              crop_info_map[i] = {
-                                  'name': node_name,
-                                  'input': input_blob,
-                                  'output': output_blob,
-                                  'start': match.group(1),
-                                  'end': match.group(2)
-                              }
 
-              # Xác định các node Split cần xóa (chỉ xóa khi tất cả output đều đi vào Crop lỗi)
-              lines_to_remove = set()
-              removed_splits = 0
-              
-              for idx in split_indices:
-                  line = lines[idx]
-                  parts = line.strip().split()
-                  num_inputs = int(parts[2])
-                  num_outputs = int(parts[3])
-                  output_blobs = parts[4+num_inputs:4+num_inputs+num_outputs]
-                  
-                  can_remove = True
-                  for ob in output_blobs:
-                      is_used_by_our_crop = False
-                      for crop_info in crop_info_map.values():
-                          if crop_info['input'] == ob:
-                              is_used_by_our_crop = True
-                              break
-                      if not is_used_by_our_crop:
-                          can_remove = False
-                          break
-                  
-                  if can_remove:
-                      lines_to_remove.add(idx)
-                      removed_splits += 1
+                      # Data blob là input đầu tiên (ví dụ: group_norm)
+                      data_blob = input_blobs[0]
 
-              # Ghi file mới
-              new_layer_count = layer_count - removed_splits
-              new_lines = [f"{magic}\n", f"{new_layer_count} {blob_count}\n"]
-              
-              replaced_crops = 0
-              for i in range(2, len(lines)):
-                  if i in lines_to_remove:
-                      continue # Xóa node Split
-                      
-                  if i in crop_info_map:
-                      crop_info = crop_info_map[i]
-                      # Nối thẳng Crop về lại tensor gốc trước Split
-                      original_input = split_map.get(crop_info['input'], crop_info['input'])
-                      # Chuyển Crop thành Slice tĩnh
-                      new_line = f"Slice            {crop_info['name']} 1 1 {original_input} {crop_info['output']} -23300=1,{crop_info['start']} -23301=1,{crop_info['end']} -23302=1,0\n"
-                      new_lines.append(new_line)
-                      replaced_crops += 1
+                      # Thay thế 1 node Slice động bằng 4 node Slice tĩnh
+                      for i, out_blob in enumerate(output_blobs):
+                          start, end = splits[i]
+                          static_slice_line = f"Slice            {node_name}_{i} 1 1 {data_blob} {out_blob} -23300=1,{start} -23301=1,{end} -23302=1,0\n"
+                          new_lines.append(static_slice_line)
+                          added_static_slices += 1
+
+                      removed_dynamic_slices += 1
                   else:
-                      new_lines.append(lines[i])
+                      new_lines.append(line)
+
+              # Cập nhật lại số lượng layer (1 dynamic bị xóa, 4 static được thêm -> cộng thêm 3 mỗi lần)
+              new_layer_count = layer_count - removed_dynamic_slices + added_static_slices
+              new_lines[1] = f"{new_layer_count} {blob_count}\n"
 
               with open(output_file, 'w') as f:
                   f.writelines(new_lines)
                   
-              print(f"✅ Auto-Fixed Param: Removed {removed_splits} Split nodes, replaced {replaced_crops} Crop nodes with Slice nodes.")
+              print(f"✅ Auto-Fixed Param: Removed {removed_dynamic_slices} dynamic Slice nodes, added {added_static_slices} static Slice nodes.")
 
           fix_ncnn_param('raw.param', '2xParagonSR_Nano_gan.param')
           PYEOF
@@ -217,15 +159,14 @@ jobs:
           echo "=== Final Param Validation ==="
           head -3 2xParagonSR_Nano_gan.param
           
-          # Đảm bảo không còn Crop lỗi
-          if grep -q "Crop.*\-23309" 2xParagonSR_Nano_gan.param; then
-            echo "⚠️ WARNING: File still contains dynamic Crop!"
+          # Đảm bảo không còn Slice động
+          if grep -q "\-23300=4,\-233" 2xParagonSR_Nano_gan.param; then
+            echo "⚠️ WARNING: File still contains dynamic Slice!"
           else
-            echo "✅ Model is completely clean from dynamic Crop/Split!"
+            echo "✅ Model is completely clean from dynamic Slice!"
           fi
 
-          echo "Slice layers: $(grep -c 'Slice' 2xParagonSR_Nano_gan.param || echo 0)"
-          echo "Crop layers: $(grep -c 'Crop' 2xParagonSR_Nano_gan.param || echo 0)"
+          echo "Static Slice layers: $(grep -c 'Slice.*\-23300=1' 2xParagonSR_Nano_gan.param || echo 0)"
 
           BIN_SIZE=$(stat -c%s "2xParagonSR_Nano_gan.bin")
           if [ "$BIN_SIZE" -lt 50000 ]; then
