@@ -128,26 +128,48 @@ jobs:
           fix_ncnn_param('raw.param', '2xParagonSR_Nano_gan.param')
           PYEOF
 
-      - name: Post-process & final check
+      - name: Post-process & clean orphan nodes
         run: |
-          cp raw.bin 2xParagonSR_Nano_gan.bin
+          cp raw.param 2xParagonSR_Nano_gan.param
+          cp raw.bin    2xParagonSR_Nano_gan.bin
 
+          # DepthToSpace → PixelShuffle
           if grep -q "DepthToSpace" 2xParagonSR_Nano_gan.param; then
             sed -i 's/DepthToSpace/PixelShuffle/g' 2xParagonSR_Nano_gan.param
           fi
 
+          # ★ Xóa 2 dòng rác val_24 (MemoryData và Split)
+          sed -i '/MemoryData.*val_24/d' 2xParagonSR_Nano_gan.param
+          sed -i '/Split.*splitncnn_0.*val_24/d' 2xParagonSR_Nano_gan.param
+
+          # ★ Cập nhật lại số layer và blob trong header
+          python3 << 'PYEOF'
+          with open('2xParagonSR_Nano_gan.param', 'r') as f:
+              lines = f.readlines()
+          
+          # Đếm lại số layer thực tế (trừ 2 dòng header)
+          actual_layers = len(lines) - 2
+          
+          # Đếm số blob duy nhất (cập nhật số thứ 2 ở dòng 2)
+          # Cách đơn giản nhất là giữ nguyên số blob cũ, NCNN tự bỏ qua blob không dùng
+          counts = lines[1].strip().split()
+          old_blobs = counts[1]
+          
+          lines[1] = f"{actual_layers} {old_blobs}\n"
+          
+          with open('2xParagonSR_Nano_gan.param', 'w') as f:
+              f.writelines(lines)
+          print(f"✅ Cleaned orphan nodes. Updated layer count to {actual_layers}")
+          PYEOF
+
           echo "=== Final Param Validation ==="
           head -3 2xParagonSR_Nano_gan.param
           
-          # Kiểm tra xem còn Slice/Crop động không
-          if grep -q "\-23300=4,\-233" 2xParagonSR_Nano_gan.param || grep -q "Crop.*\-23309" 2xParagonSR_Nano_gan.param; then
-            echo "⚠️ WARNING: File still contains dynamic patterns!"
+          if grep -q "\-23300=4,\-233" 2xParagonSR_Nano_gan.param || grep -q "val_24" 2xParagonSR_Nano_gan.param; then
+            echo "⚠️ WARNING: File still contains dynamic patterns or orphans!"
           else
-            echo "✅ Model is completely clean from dynamic Slice/Crop!"
+            echo "✅ Model is completely clean!"
           fi
-
-          echo "Slice layers: $(grep -c 'Slice' 2xParagonSR_Nano_gan.param || echo 0)"
-          echo "Crop layers: $(grep -c 'Crop' 2xParagonSR_Nano_gan.param || echo 0)"
 
           echo "=== CONVERSION SUCCESS ==="
           ls -lh 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
